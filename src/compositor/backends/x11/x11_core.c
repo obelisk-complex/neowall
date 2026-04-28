@@ -119,6 +119,95 @@ static bool x11_init_atoms(x11_backend_data_t *backend) {
     return true;
 }
 
+/* Decide whether the running WM honours _NET_WM_WINDOW_TYPE_DESKTOP for
+ * non-override-redirect windows. Compositing/floating WMs (Mutter, Muffin,
+ * KWin, Xfwm4, Compiz, Marco, Openbox, Fluxbox, Awesome) place desktop-typed
+ * managed windows at the bottom of the stack. Tiling WMs (i3, bspwm, dwm,
+ * xmonad) either ignore the hint or insert the window into a tile, so for
+ * those we keep override-redirect and rely on XLowerWindow.
+ *
+ * Detection: read _NET_SUPPORTING_WM_CHECK -> child window's _NET_WM_NAME
+ * (UTF8_STRING) and match against a whitelist of EWMH-friendly WMs.
+ *
+ * Override via env: NEOWALL_X11_OVERRIDE_REDIRECT=1 forces OR; =0 forces
+ * managed; unset/auto runs the detection. */
+static bool x11_wm_honours_desktop_type(x11_backend_data_t *backend) {
+    const char *env = getenv("NEOWALL_X11_OVERRIDE_REDIRECT");
+    if (env) {
+        if (env[0] == '0') {
+            log_info("X11 WM detection: NEOWALL_X11_OVERRIDE_REDIRECT=0, "
+                     "using managed wallpaper window");
+            return true;
+        }
+        if (env[0] == '1') {
+            log_info("X11 WM detection: NEOWALL_X11_OVERRIDE_REDIRECT=1, "
+                     "using override-redirect wallpaper window");
+            return false;
+        }
+    }
+
+    Display *dpy = backend->x_display;
+    Atom net_supporting = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
+    Atom net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
+    Atom utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
+
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long nitems = 0, bytes_after = 0;
+    unsigned char *prop = NULL;
+
+    if (XGetWindowProperty(dpy, backend->root_window, net_supporting, 0, 1,
+                           False, XA_WINDOW, &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) != Success ||
+        actual_type != XA_WINDOW || nitems != 1 || !prop) {
+        if (prop) XFree(prop);
+        log_info("X11 WM detection: no _NET_SUPPORTING_WM_CHECK; "
+                 "using override-redirect");
+        return false;
+    }
+
+    Window wm_window = *(Window *)prop;
+    XFree(prop);
+    prop = NULL;
+
+    if (wm_window == 0) {
+        log_info("X11 WM detection: no EWMH WM; using override-redirect");
+        return false;
+    }
+
+    if (XGetWindowProperty(dpy, wm_window, net_wm_name, 0, 256, False,
+                           utf8_string, &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) != Success ||
+        !prop) {
+        if (prop) XFree(prop);
+        log_info("X11 WM detection: WM has no _NET_WM_NAME; "
+                 "using override-redirect");
+        return false;
+    }
+
+    char wm_name[128];
+    size_t copy = nitems < sizeof(wm_name) - 1 ? nitems : sizeof(wm_name) - 1;
+    memcpy(wm_name, prop, copy);
+    wm_name[copy] = '\0';
+    XFree(prop);
+
+    static const char *managed_wms[] = {
+        "Mutter", "Mutter (Muffin)", "Muffin", "GNOME Shell",
+        "KWin", "Xfwm4", "Compiz", "Marco", "Openbox", "Fluxbox",
+        "Metacity", "Awesome", NULL,
+    };
+
+    for (size_t i = 0; managed_wms[i]; i++) {
+        if (strcmp(wm_name, managed_wms[i]) == 0) {
+            log_info("X11 WM detected: '%s' (managed wallpaper window)", wm_name);
+            return true;
+        }
+    }
+
+    log_info("X11 WM detected: '%s' (using override-redirect)", wm_name);
+    return false;
+}
+
 /* ============================================================================
  * XRANDR DETECTION
  * ============================================================================ */
@@ -367,9 +456,15 @@ static struct compositor_surface *x11_create_surface(void *backend_data,
                                      ZPixmap, 0, (char *)surf_data->pixel_buffer,
                                      width, height, 32, 0);
 
-    /* Create a fullscreen window at the bottom of the stack */
+    /* Decide window-management style based on the running WM. Compositing
+     * managers (Mutter/Muffin/KWin/Xfwm/etc.) place override-redirect windows
+     * above normal toplevels (treated as popups), so we use a managed window
+     * with EWMH desktop hints. Tiling WMs ignore desktop hints, so for them
+     * we keep override-redirect and rely on XLowerWindow. */
+    Bool use_managed = x11_wm_honours_desktop_type(backend) ? True : False;
+
     XSetWindowAttributes attrs;
-    attrs.override_redirect = True;  /* Bypass WM completely */
+    attrs.override_redirect = use_managed ? False : True;
     attrs.background_pixel = BlackPixel(backend->x_display, backend->screen);
     attrs.border_pixel = 0;
     attrs.event_mask = ExposureMask | StructureNotifyMask |
