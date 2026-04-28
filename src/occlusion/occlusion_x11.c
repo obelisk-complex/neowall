@@ -154,23 +154,36 @@ static void check_fullscreen_state(void) {
     pthread_rwlock_rdlock(&g_state->output_list_lock);
 
     struct output_state *output = g_state->outputs;
-    int output_idx = 0;
     while (output) {
         if (!output->config->pause_on_fullscreen) {
             output = output->next;
-            output_idx++;
             continue;
         }
 
         bool was_occluded = atomic_load_explicit(&output->occluded, memory_order_acquire);
         bool is_occluded = false;
 
-        /* Find the XRandR monitor matching this output index */
-        if (output_idx < num_monitors && monitors) {
-            int mx = monitors[output_idx].x;
-            int my = monitors[output_idx].y;
-            int mw = monitors[output_idx].width;
-            int mh = monitors[output_idx].height;
+        /* Match XRandR monitor by geometry, not list order — list order between
+         * the kernel's RandR enumeration and our linked list is not guaranteed. */
+        int matched = -1;
+        if (monitors && num_monitors > 0 &&
+            output->logical_width > 0 && output->logical_height > 0) {
+            for (int m = 0; m < num_monitors; m++) {
+                if (monitors[m].x == output->logical_x &&
+                    monitors[m].y == output->logical_y &&
+                    monitors[m].width == output->logical_width &&
+                    monitors[m].height == output->logical_height) {
+                    matched = m;
+                    break;
+                }
+            }
+        }
+
+        if (matched >= 0) {
+            int mx = monitors[matched].x;
+            int my = monitors[matched].y;
+            int mw = monitors[matched].width;
+            int mh = monitors[matched].height;
 
             /* Check if any fullscreen window covers this monitor */
             for (int i = 0; i < fs_count; i++) {
@@ -200,7 +213,7 @@ static void check_fullscreen_state(void) {
         atomic_store_explicit(&output->occluded, is_occluded, memory_order_release);
 
         if (was_occluded && !is_occluded) {
-            output->needs_redraw = true;
+            atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
             const char *name = output->connector_name[0] ? output->connector_name : output->model;
             log_info("Output %s un-occluded, resuming rendering", name);
         } else if (!was_occluded && is_occluded) {
@@ -209,7 +222,6 @@ static void check_fullscreen_state(void) {
         }
 
         output = output->next;
-        output_idx++;
     }
 
     pthread_rwlock_unlock(&g_state->output_list_lock);

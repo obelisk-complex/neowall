@@ -227,15 +227,25 @@ static void render_outputs(struct neowall_state *state) {
             }
         }
 
-        /* Skip rendering if output is occluded by a fullscreen window */
-        if (output->config->pause_on_fullscreen &&
+        /* Skip rendering if output is occluded by a fullscreen window — but
+         * never skip the FIRST paint, otherwise the layer-shell surface gets
+         * configured without an attached buffer and the compositor may unmap it. */
+        if (output->first_paint_done &&
+            output->config->pause_on_fullscreen &&
             atomic_load_explicit(&output->occluded, memory_order_acquire)) {
             output = output->next;
             continue;
         }
 
+        /* Skip dead surfaces (EGL_BAD_SURFACE / EGL_CONTEXT_LOST observed) */
+        if (atomic_load_explicit(&output->surface_dead, memory_order_relaxed)) {
+            output = output->next;
+            continue;
+        }
+
         /* Check if this output needs rendering */
-        if (output->needs_redraw && output->compositor_surface &&
+        if (atomic_load_explicit(&output->needs_redraw, memory_order_relaxed) &&
+            output->compositor_surface &&
             output->compositor_surface->egl_surface != EGL_NO_SURFACE) {
             /* Make EGL context current for this output */
             if (!eglMakeCurrent(state->egl_display, output->compositor_surface->egl_surface,
@@ -392,9 +402,19 @@ static void render_outputs(struct neowall_state *state) {
 
             /* Swap buffers - this can BLOCK waiting for vsync, so no locks must be held */
             if (!eglSwapBuffers(state->egl_display, output->compositor_surface->egl_surface)) {
+                EGLint swap_err = eglGetError();
                 log_error("Failed to swap buffers for output %s: 0x%x",
-                         output->model, eglGetError());
+                         output->model, swap_err);
                 state->errors_count++;
+
+                if (swap_err == EGL_BAD_SURFACE || swap_err == EGL_CONTEXT_LOST) {
+                    if (!atomic_exchange_explicit(&output->surface_dead, true,
+                                                  memory_order_relaxed)) {
+                        log_error("Marking output %s surface dead (egl error 0x%x), "
+                                 "will skip future renders",
+                                 output->model, swap_err);
+                    }
+                }
             } else {
                 /* Log swap success every 60 frames to verify buffer swapping is working */
                 static uint64_t swap_counter = 0;
@@ -409,6 +429,7 @@ static void render_outputs(struct neowall_state *state) {
                 compositor_surface_commit(output->compositor_surface);
 
                 output->last_frame_time = current_time;
+                output->first_paint_done = true;
                 state->frames_rendered++;
 
                 /* Clean up transition after final frame is rendered */
@@ -430,7 +451,7 @@ static void render_outputs(struct neowall_state *state) {
                 if ((output->transition_start_time == 0 ||
                      output->config->transition == TRANSITION_NONE) &&
                     output->config->type != WALLPAPER_SHADER) {
-                    output->needs_redraw = false;
+                    atomic_store_explicit(&output->needs_redraw, false, memory_order_relaxed);
                 }
             }
         }
@@ -557,7 +578,7 @@ void event_loop_run(struct neowall_state *state) {
     pthread_rwlock_rdlock(&state->output_list_lock);
     output = state->outputs;
     while (output) {
-        output->needs_redraw = true;
+        atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
         output = output->next;
     }
     pthread_rwlock_unlock(&state->output_list_lock);
@@ -770,7 +791,8 @@ void event_loop_run(struct neowall_state *state) {
                     /* Mark all outputs for redraw so render_outputs() is called */
                     struct output_state *timer_output = state->outputs;
                     while (timer_output) {
-                        timer_output->needs_redraw = true;
+                        atomic_store_explicit(&timer_output->needs_redraw, true,
+                                              memory_order_relaxed);
                         timer_output = timer_output->next;
                     }
                 }
@@ -804,7 +826,8 @@ void event_loop_run(struct neowall_state *state) {
                         }
                         /* Mark the specific output for redraw */
                         if (frame_timer_outputs[i]) {
-                            frame_timer_outputs[i]->needs_redraw = true;
+                            atomic_store_explicit(&frame_timer_outputs[i]->needs_redraw,
+                                                  true, memory_order_relaxed);
                         }
                     }
                 }
@@ -841,7 +864,7 @@ void event_loop_run(struct neowall_state *state) {
         bool any_needs_redraw = false;
         output = state->outputs;
         while (output) {
-            if (output->needs_redraw) {
+            if (atomic_load_explicit(&output->needs_redraw, memory_order_relaxed)) {
                 any_needs_redraw = true;
                 break;
             }
@@ -881,7 +904,7 @@ void event_loop_run(struct neowall_state *state) {
             /* Keep redrawing during transitions */
             if (output->transition_start_time > 0 &&
                 output->config->transition != TRANSITION_NONE) {
-                output->needs_redraw = true;
+                atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
             }
             /* For shader wallpapers with vsync enabled, always redraw (vsync paces us)
              * For shaders with vsync disabled, only redraw when frame timer fires (handled above) */
@@ -891,7 +914,8 @@ void event_loop_run(struct neowall_state *state) {
                 /* Only auto-redraw if vsync is enabled (paced by eglSwapBuffers)
                  * or if there's no frame timer configured */
                 if (output->config->vsync || output_get_frame_timer_fd(output) < 0) {
-                    output->needs_redraw = true;
+                    atomic_store_explicit(&output->needs_redraw, true,
+                                          memory_order_relaxed);
                 }
             }
             output = output->next;
@@ -939,7 +963,7 @@ void event_loop_request_redraw(struct neowall_state *state) {
 
     struct output_state *output = state->outputs;
     while (output) {
-        output->needs_redraw = true;
+        atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
         output = output->next;
     }
 }
@@ -947,6 +971,6 @@ void event_loop_request_redraw(struct neowall_state *state) {
 /* Request a redraw for a specific output */
 void event_loop_request_output_redraw(struct output_state *output) {
     if (output) {
-        output->needs_redraw = true;
+        atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
     }
 }

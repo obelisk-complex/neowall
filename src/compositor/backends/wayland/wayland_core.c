@@ -43,19 +43,23 @@ static bool wait_for_outputs_configured(struct neowall_state *state);
 static void xdg_output_handle_logical_position(void *data,
                                                  struct zxdg_output_v1 *xdg_output,
                                                  int32_t x, int32_t y) {
-    (void)data;
+    struct output_state *output = data;
     (void)xdg_output;
-    (void)x;
-    (void)y;
+    if (output) {
+        output->logical_x = x;
+        output->logical_y = y;
+    }
 }
 
 static void xdg_output_handle_logical_size(void *data,
                                             struct zxdg_output_v1 *xdg_output,
                                             int32_t width, int32_t height) {
-    (void)data;
+    struct output_state *output = data;
     (void)xdg_output;
-    (void)width;
-    (void)height;
+    if (output && width > 0 && height > 0) {
+        output->logical_width = width;
+        output->logical_height = height;
+    }
 }
 
 static void xdg_output_handle_done(void *data, struct zxdg_output_v1 *xdg_output) {
@@ -138,7 +142,9 @@ static void output_handle_mode(void *data, struct wl_output *wl_output,
                  output->model[0] ? output->model : "unknown",
                  width, height, refresh);
 
-        output_apply_render_size(output, "mode event", NULL);
+        /* Defer output_apply_render_size to output_handle_done — wl_output.mode
+         * can fire mid-burst with stale intermediate values; the final state is
+         * only valid after `done`. */
     }
 }
 
@@ -147,6 +153,7 @@ static void output_handle_done(void *data, struct wl_output *wl_output) {
     (void)wl_output;
 
     output->configured = true;
+    output_apply_render_size(output, "output done", NULL);
     log_info("Output %s: configuration done (reconnect recovery enabled)",
               output->model[0] ? output->model : "unknown");
 }
@@ -243,7 +250,7 @@ static bool output_apply_render_size(struct output_state *output,
 
     output->width = physical_w;
     output->height = physical_h;
-    output->needs_redraw = true;
+    atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
 
     if (out_changed) {
         *out_changed = true;
@@ -483,6 +490,12 @@ bool wayland_init_registry(struct neowall_state *state) {
 
     wayland_t *wl = &g_wayland;
 
+    /* Idempotency guard — second entry would memset live state and orphan
+     * compositor objects, killing already-bound layer surfaces. */
+    if (wl->initialized) {
+        return true;
+    }
+
     /* Initialize the wayland structure */
     memset(wl, 0, sizeof(wayland_t));
     wl->state = state;
@@ -522,6 +535,32 @@ bool wayland_init_registry(struct neowall_state *state) {
     if (!wl->compositor) {
         log_error("Compositor not available");
         return false;
+    }
+
+    /* Second-pass xdg_output binding: bind for any output that pre-dates the
+     * xdg_output_manager global. Without this, fractional-scale compositors
+     * leave logical_width/height zero and connector_name blank. */
+    if (wl->xdg_output_manager) {
+        pthread_rwlock_rdlock(&state->output_list_lock);
+        struct output_state *o = state->outputs;
+        int retro_bound = 0;
+        while (o) {
+            if (!o->xdg_output && o->native_output) {
+                o->xdg_output = zxdg_output_manager_v1_get_xdg_output(
+                    wl->xdg_output_manager, (struct wl_output *)o->native_output);
+                if (o->xdg_output) {
+                    zxdg_output_v1_add_listener(o->xdg_output,
+                                                &xdg_output_listener, o);
+                    retro_bound++;
+                }
+            }
+            o = o->next;
+        }
+        pthread_rwlock_unlock(&state->output_list_lock);
+        if (retro_bound > 0) {
+            log_debug("Retroactively bound xdg_output for %d output(s)", retro_bound);
+            wl_display_roundtrip(wl->display);
+        }
     }
 
     /* Mark as initialized */

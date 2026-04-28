@@ -92,8 +92,12 @@ struct output_state {
     char connector_name[64];    /* Connector name (e.g., HDMI-A-2, DP-1) from xdg-output */
 
     bool configured;
-    bool needs_redraw;
+    atomic_bool_t needs_redraw;
     atomic_bool_t occluded;             /* Output is fully occluded by a fullscreen window */
+    atomic_bool_t surface_dead;         /* EGL surface lost (BAD_SURFACE/CONTEXT_LOST) — skip rendering */
+    bool first_paint_done;              /* True after the first successful render+swap */
+    int32_t logical_x;
+    int32_t logical_y;
 
     struct neowall_state *state;  /* Back-pointer to global state */
 
@@ -115,6 +119,7 @@ struct output_state {
     /* Background thread for async image loading */
     pthread_t preload_thread;           /* Background preload thread */
     atomic_bool_t preload_thread_active; /* Is background thread running? */
+    atomic_bool_t preload_should_stop;  /* Cooperative shutdown flag */
     pthread_mutex_t preload_mutex;      /* Protects preload_image during thread handoff */
     struct image_data *preload_decoded_image; /* Image decoded in background, ready for GPU upload */
     atomic_bool_t preload_upload_pending; /* Background thread finished, main thread should upload */
@@ -173,6 +178,8 @@ struct output_state {
     float transition_progress;
     uint64_t frames_rendered;
     bool shader_load_failed;            /* Set to true after 3 failed shader load attempts */
+    int shader_consecutive_failures;    /* Per-output reload-failure counter */
+    uint64_t shader_last_reload_attempt_time; /* Per-output last reload attempt time */
     
     /* FPS measurement */
     uint64_t fps_last_log_time;         /* Last time we logged FPS */

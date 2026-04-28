@@ -541,28 +541,6 @@ static struct compositor_surface *wlr_create_surface(void *data,
 
     zwlr_layer_surface_v1_set_keyboard_interactivity(surface_data->layer_surface, kb_mode);
 
-    /* Enable tearing control for immediate presentation (bypasses compositor vsync) */
-    if (wl && wl->tearing_control_manager) {
-        struct wp_tearing_control_v1 *tearing = wp_tearing_control_manager_v1_get_tearing_control(
-            wl->tearing_control_manager,
-            wl_surface
-        );
-        surface->tearing_control = tearing;
-
-        if (tearing) {
-            /* Set presentation hint to async (immediate/tearing allowed) */
-            wp_tearing_control_v1_set_presentation_hint(
-                tearing,
-                WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC
-            );
-            log_info("Enabled tearing control for immediate presentation (bypasses compositor FPS limits)");
-        } else {
-            log_error("Failed to create tearing control object");
-        }
-    } else {
-        log_debug("Tearing control manager not available - FPS may be limited by compositor");
-    }
-
     log_debug("wlr layer surface created and configured successfully");
 
     return surface;

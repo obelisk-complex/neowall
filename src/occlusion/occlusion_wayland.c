@@ -24,12 +24,14 @@
  * We use this to set output->occluded when a fullscreen window covers it.
  */
 
+#define MAX_OUTPUTS_PER_TOPLEVEL 8
+
 /* Tracked toplevel window */
 typedef struct tracked_toplevel {
     struct zwlr_foreign_toplevel_handle_v1 *handle;
-    uint32_t state;              /* Bitmask of toplevel states */
-    struct wl_output *output;    /* Current output (last entered) */
-    bool has_output;             /* Whether we know the output */
+    uint32_t state;                                     /* Bitmask of toplevel states */
+    struct wl_output *outputs[MAX_OUTPUTS_PER_TOPLEVEL]; /* Outputs this toplevel touches */
+    int output_count;
     char app_id[128];
     struct tracked_toplevel *next;
 } tracked_toplevel_t;
@@ -71,8 +73,14 @@ static void toplevel_handle_output_enter(void *data,
                                          struct wl_output *output) {
     tracked_toplevel_t *tl = data;
     (void)handle;
-    tl->output = output;
-    tl->has_output = true;
+    for (int i = 0; i < tl->output_count; i++) {
+        if (tl->outputs[i] == output) {
+            return;
+        }
+    }
+    if (tl->output_count < MAX_OUTPUTS_PER_TOPLEVEL) {
+        tl->outputs[tl->output_count++] = output;
+    }
 }
 
 static void toplevel_handle_output_leave(void *data,
@@ -80,9 +88,12 @@ static void toplevel_handle_output_leave(void *data,
                                          struct wl_output *output) {
     tracked_toplevel_t *tl = data;
     (void)handle;
-    if (tl->output == output) {
-        tl->output = NULL;
-        tl->has_output = false;
+    for (int i = 0; i < tl->output_count; i++) {
+        if (tl->outputs[i] == output) {
+            tl->outputs[i] = tl->outputs[--tl->output_count];
+            tl->outputs[tl->output_count] = NULL;
+            return;
+        }
     }
 }
 
@@ -211,9 +222,18 @@ static void recalculate_occlusion(void) {
 
         tracked_toplevel_t *tl = toplevels;
         while (tl) {
-            /* Check if this toplevel is fullscreen on this output */
-            if (tl->has_output && tl->output == output->native_output &&
-                (tl->state & (1u << ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_FULLSCREEN))) {
+            if (!(tl->state & (1u << ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_FULLSCREEN))) {
+                tl = tl->next;
+                continue;
+            }
+            bool tl_on_this_output = false;
+            for (int i = 0; i < tl->output_count; i++) {
+                if (tl->outputs[i] == output->native_output) {
+                    tl_on_this_output = true;
+                    break;
+                }
+            }
+            if (tl_on_this_output) {
                 is_occluded = true;
                 break;
             }
@@ -223,7 +243,7 @@ static void recalculate_occlusion(void) {
         atomic_store_explicit(&output->occluded, is_occluded, memory_order_release);
 
         if (was_occluded && !is_occluded) {
-            output->needs_redraw = true;
+            atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
             const char *name = output->connector_name[0] ? output->connector_name : output->model;
             log_info("Output %s un-occluded, resuming rendering", name);
         } else if (!was_occluded && is_occluded) {

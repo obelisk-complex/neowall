@@ -174,8 +174,14 @@ struct output_state *output_create(struct neowall_state *state,
     out->scale = 1;
     out->transform = COMPOSITOR_TRANSFORM_NORMAL;
     out->configured = false;
-    out->needs_redraw = true;
-    atomic_store(&out->occluded, false);
+    atomic_init(&out->needs_redraw, true);
+    atomic_init(&out->occluded, false);
+    atomic_init(&out->surface_dead, false);
+    out->first_paint_done = false;
+    out->logical_x = 0;
+    out->logical_y = 0;
+    out->shader_consecutive_failures = 0;
+    out->shader_last_reload_attempt_time = 0;
     out->state = state;
     out->connector_name[0] = '\0';
 
@@ -188,8 +194,9 @@ struct output_state *output_create(struct neowall_state *state,
     /* Initialize background preload thread state */
     pthread_mutex_init(&out->preload_mutex, NULL);
     out->preload_decoded_image = NULL;
-    atomic_store(&out->preload_thread_active, false);
-    atomic_store(&out->preload_upload_pending, false);
+    atomic_init(&out->preload_thread_active, false);
+    atomic_init(&out->preload_should_stop, false);
+    atomic_init(&out->preload_upload_pending, false);
 
     /* Compositor surface will be created later in output_configure_compositor_surface() */
     out->compositor_surface = NULL;
@@ -287,12 +294,14 @@ void output_destroy(struct output_state *output) {
         output->next_image = NULL;
     }
 
-    /* Cancel and wait for background preload thread if active */
-    if (atomic_load(&output->preload_thread_active)) {
-        pthread_cancel(output->preload_thread);
+    /* Cooperative shutdown of the preload thread, then join. We always join
+     * (never detach) so the thread cannot reference a freed output_state. */
+    atomic_store_explicit(&output->preload_should_stop, true, memory_order_release);
+    if (output->preload_thread) {
         pthread_join(output->preload_thread, NULL);
-        atomic_store(&output->preload_thread_active, false);
+        output->preload_thread = 0;
     }
+    atomic_store(&output->preload_thread_active, false);
 
     /* Free preload data */
     pthread_mutex_lock(&output->preload_mutex);
@@ -406,15 +415,29 @@ static void *preload_thread_func(void *arg) {
     struct preload_thread_args *args = (struct preload_thread_args *)arg;
     struct output_state *output = args->output;
 
-    /* Enable thread cancellation at any time */
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+    /* Cooperative shutdown only — async cancellation through malloc/image_load
+     * was a recipe for use-after-free and locked mutexes. */
+
+    if (atomic_load_explicit(&output->preload_should_stop, memory_order_acquire)) {
+        atomic_store(&output->preload_thread_active, false);
+        free(args);
+        return NULL;
+    }
 
     log_debug("Background thread: decoding image %s (%dx%d, mode=%d)",
               args->path, args->width, args->height, args->mode);
 
     /* Decode image in background (CPU-bound, no GL context needed) */
     struct image_data *decoded_image = image_load(args->path, args->width, args->height, args->mode);
+
+    if (atomic_load_explicit(&output->preload_should_stop, memory_order_acquire)) {
+        if (decoded_image) {
+            image_free(decoded_image);
+        }
+        atomic_store(&output->preload_thread_active, false);
+        free(args);
+        return NULL;
+    }
 
     if (!decoded_image) {
         log_error("Background thread: failed to decode image: %s", args->path);
@@ -505,7 +528,15 @@ void output_preload_next_wallpaper(struct output_state *output) {
     log_debug("Starting background preload for output %s: %s",
               output->model[0] ? output->model : "unknown", args->path);
 
-    /* Launch background thread */
+    /* If a previous joinable preload thread finished without us joining,
+     * reap it now to avoid a resource leak. */
+    if (!atomic_load(&output->preload_thread_active) && output->preload_thread) {
+        pthread_join(output->preload_thread, NULL);
+        output->preload_thread = 0;
+    }
+
+    /* Launch background thread (joinable — destroyer will join). */
+    atomic_store(&output->preload_should_stop, false);
     atomic_store(&output->preload_thread_active, true);
     if (pthread_create(&output->preload_thread, NULL, preload_thread_func, args) != 0) {
         log_error("Failed to create preload thread");
@@ -513,9 +544,6 @@ void output_preload_next_wallpaper(struct output_state *output) {
         free(args);
         return;
     }
-
-    /* Detach thread so it cleans up automatically when done */
-    pthread_detach(output->preload_thread);
 
     log_debug("Background preload thread started for: %s", args->path);
 }
@@ -694,7 +722,7 @@ void output_set_wallpaper(struct output_state *output, const char *path) {
                          "active");
 
     /* Mark for redraw */
-    output->needs_redraw = true;
+    atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
 
     /* Preload next wallpaper if cycling is enabled */
     if (output->config->cycle && output->config->cycle_count > 1) {
@@ -877,7 +905,7 @@ void output_set_shader(struct output_state *output, const char *shader_path) {
                          "active");
 
     /* Mark for immediate redraw with new shader */
-    output->needs_redraw = true;
+    atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
     
     /* Initialize frame time for animation */
     uint64_t now = get_time_ms();
@@ -1045,7 +1073,7 @@ void output_cycle_wallpaper(struct output_state *output) {
         }
 
         /* Mark the output for redraw to ensure change is visible */
-        output->needs_redraw = true;
+        atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
     }
 
     /* Update cycle list file for 'neowall list' command */
@@ -1115,7 +1143,7 @@ void output_set_cycle_index(struct output_state *output, size_t index) {
     }
 
     /* Mark for redraw */
-    output->needs_redraw = true;
+    atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
 
     /* Update cycle list file for 'neowall list' command */
     if (output->config->cycle_paths && output->config->cycle_count > 0) {
@@ -1352,7 +1380,7 @@ bool output_apply_config(struct output_state *output, struct wallpaper_config *c
     output->last_cycle_time = get_time_ms();
 
     /* Request immediate redraw */
-    output->needs_redraw = true;
+    atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
 
     log_info("Successfully applied config to output %s", output->model);
     return true;

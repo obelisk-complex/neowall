@@ -1,3 +1,9 @@
+/* Pull in XSI extensions for sigaltstack(2)/SA_ONSTACK/SIGSTKSZ; the project
+ * already sets _POSIX_C_SOURCE=200809L, but those identifiers are XSI. */
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,9 +46,17 @@ static const char *get_set_index_file_path(void) {
 /* Write the requested index to a file for the daemon to read */
 static bool write_set_index_file(int index) {
     const char *path = get_set_index_file_path();
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
+    int fd = open(path,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                  0600);
+    if (fd < 0) {
         fprintf(stderr, "Failed to write index file: %s\n", strerror(errno));
+        return false;
+    }
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) {
+        fprintf(stderr, "fdopen failed: %s\n", strerror(errno));
+        close(fd);
         return false;
     }
     fprintf(fp, "%d\n", index);
@@ -53,8 +67,13 @@ static bool write_set_index_file(int index) {
 /* Read the requested index from the file (called by daemon) */
 int read_set_index_file(void) {
     const char *path = get_set_index_file_path();
-    FILE *fp = fopen(path, "r");
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    FILE *fp = fdopen(fd, "r");
     if (!fp) {
+        close(fd);
         return -1;
     }
     int index = -1;
@@ -123,10 +142,18 @@ static const char *get_pid_file_path(void) {
 /* Write PID file */
 static bool write_pid_file(void) {
     const char *pid_path = get_pid_file_path();
-    FILE *fp = fopen(pid_path, "w");
-
-    if (!fp) {
+    int fd = open(pid_path,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                  0600);
+    if (fd < 0) {
         log_error("Failed to create PID file %s: %s", pid_path, strerror(errno));
+        return false;
+    }
+
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) {
+        log_error("Failed to fdopen PID file: %s", strerror(errno));
+        close(fd);
         return false;
     }
 
@@ -474,32 +501,22 @@ void handle_signal_from_fd(struct neowall_state *state, int signum) {
     }
 }
 
-/* Handle crash signals - these still need traditional handlers */
+/* Handle crash signals — async-signal-safe ONLY.
+ * No localtime/printf/exit; just write a fixed message and _exit. */
 static void handle_crash(int signum) {
-    const char *signame = "UNKNOWN";
+    const char *signame;
     switch (signum) {
-        case SIGSEGV: signame = "SIGSEGV (Segmentation fault)"; break;
-        case SIGBUS: signame = "SIGBUS (Bus error)"; break;
-        case SIGILL: signame = "SIGILL (Illegal instruction)"; break;
-        case SIGFPE: signame = "SIGFPE (Floating point exception)"; break;
-        case SIGABRT: signame = "SIGABRT (Abort)"; break;
+        case SIGSEGV: signame = "neowall: fatal SIGSEGV\n"; break;
+        case SIGBUS:  signame = "neowall: fatal SIGBUS\n";  break;
+        case SIGILL:  signame = "neowall: fatal SIGILL\n";  break;
+        case SIGFPE:  signame = "neowall: fatal SIGFPE\n";  break;
+        case SIGABRT: signame = "neowall: fatal SIGABRT\n"; break;
+        default:      signame = "neowall: fatal signal\n";  break;
     }
-
-    log_error("CRASH: Received %s (signal %d)", signame, signum);
-    log_error("This likely occurred due to GPU/display disconnection or driver issue");
-    log_error("Error count: %lu, Frames rendered: %lu",
-              global_state ? global_state->errors_count : 0,
-              global_state ? global_state->frames_rendered : 0);
-
-    log_error("To get a backtrace, run: gdb -p %d", getpid());
-    log_error("Then use 'bt' command in gdb");
-
-    if (global_state) {
-        log_error("Attempting graceful shutdown...");
-        atomic_store_explicit(&global_state->running, false, memory_order_release);
-    }
-
-    exit(EXIT_FAILURE);
+    /* write(2) is async-signal-safe; ignore short-write/EINTR — best effort. */
+    ssize_t r = write(STDERR_FILENO, signame, strlen(signame));
+    (void)r;
+    _exit(128 + signum);
 }
 
 /* ============================================================================
@@ -536,21 +553,32 @@ static int setup_signalfd(void) {
 }
 
 static void setup_crash_handlers(void) {
-    /* Crash signals still need traditional handlers since they're fatal */
+    /* Run crash handlers on a dedicated stack so SIGSEGV from stack overflow
+     * still has somewhere to live. */
+    static char altstack[SIGSTKSZ];
+    stack_t ss = { .ss_sp = altstack, .ss_size = SIGSTKSZ, .ss_flags = 0 };
+    if (sigaltstack(&ss, NULL) != 0) {
+        log_error("Failed to install signal alt-stack: %s", strerror(errno));
+    }
+
     struct sigaction crash_sa;
     memset(&crash_sa, 0, sizeof(crash_sa));
     crash_sa.sa_handler = handle_crash;
     sigemptyset(&crash_sa.sa_mask);
-    crash_sa.sa_flags = SA_RESETHAND;  /* Reset to default after first crash */
+    crash_sa.sa_flags = SA_RESETHAND | SA_ONSTACK;
 
     sigaction(SIGSEGV, &crash_sa, NULL);
-    sigaction(SIGBUS, &crash_sa, NULL);
-    sigaction(SIGILL, &crash_sa, NULL);
-    sigaction(SIGFPE, &crash_sa, NULL);
+    sigaction(SIGBUS,  &crash_sa, NULL);
+    sigaction(SIGILL,  &crash_sa, NULL);
+    sigaction(SIGFPE,  &crash_sa, NULL);
     sigaction(SIGABRT, &crash_sa, NULL);
 
     /* Ignore SIGPIPE */
-    signal(SIGPIPE, SIG_IGN);
+    struct sigaction ign_sa;
+    memset(&ign_sa, 0, sizeof(ign_sa));
+    ign_sa.sa_handler = SIG_IGN;
+    sigemptyset(&ign_sa.sa_mask);
+    sigaction(SIGPIPE, &ign_sa, NULL);
 
     log_debug("Crash signal handlers installed");
 }

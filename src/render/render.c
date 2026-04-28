@@ -403,6 +403,34 @@ void render_cleanup_output(struct output_state *output) {
 
     log_debug("Cleaning up rendering for output %s", output->model);
 
+    /* Make this output's EGL context current so glDelete* is not a no-op.
+     * Save the previously-current state to restore afterwards. */
+    EGLDisplay restore_dpy = EGL_NO_DISPLAY;
+    EGLSurface restore_draw = EGL_NO_SURFACE;
+    EGLSurface restore_read = EGL_NO_SURFACE;
+    EGLContext restore_ctx = EGL_NO_CONTEXT;
+    bool ctx_made_current = false;
+
+    if (output->state &&
+        output->state->egl_display != EGL_NO_DISPLAY &&
+        output->state->egl_context != EGL_NO_CONTEXT &&
+        output->compositor_surface &&
+        output->compositor_surface->egl_surface != EGL_NO_SURFACE) {
+        restore_dpy = eglGetCurrentDisplay();
+        restore_draw = eglGetCurrentSurface(EGL_DRAW);
+        restore_read = eglGetCurrentSurface(EGL_READ);
+        restore_ctx = eglGetCurrentContext();
+        if (eglMakeCurrent(output->state->egl_display,
+                           output->compositor_surface->egl_surface,
+                           output->compositor_surface->egl_surface,
+                           output->state->egl_context)) {
+            ctx_made_current = true;
+        } else {
+            log_error("render_cleanup_output: eglMakeCurrent failed (0x%x); "
+                     "GL deletes may leak GPU resources", eglGetError());
+        }
+    }
+
     /* Delete VAO */
     if (output->vao) {
         glDeleteVertexArrays(1, &output->vao);
@@ -470,6 +498,17 @@ void render_cleanup_output(struct output_state *output) {
     if (output->live_shader_program != 0) {
         shader_destroy_program(output->live_shader_program);
         output->live_shader_program = 0;
+    }
+
+    /* Restore previously-current EGL state */
+    if (ctx_made_current && output->state &&
+        output->state->egl_display != EGL_NO_DISPLAY) {
+        if (restore_dpy != EGL_NO_DISPLAY && restore_ctx != EGL_NO_CONTEXT) {
+            eglMakeCurrent(restore_dpy, restore_draw, restore_read, restore_ctx);
+        } else {
+            eglMakeCurrent(output->state->egl_display, EGL_NO_SURFACE,
+                           EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        }
     }
 }
 
@@ -830,7 +869,7 @@ bool render_update_channel_texture(struct output_state *output, size_t channel_i
     image_free(img);
 
     /* Mark for redraw */
-    output->needs_redraw = true;
+    atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
 
     return true;
 }
@@ -958,10 +997,10 @@ bool render_frame_shader(struct output_state *output) {
      * - vsync mode: always set needs_redraw (monitor refresh drives rendering)
      * - vsync off: only set if frame timer hasn't expired (timer drives rendering) */
     if (output->config->vsync) {
-        output->needs_redraw = true;
+        atomic_store_explicit(&output->needs_redraw, true, memory_order_relaxed);
     } else {
         /* Frame timer controls redraw scheduling in vsync-off mode */
-        output->needs_redraw = false;
+        atomic_store_explicit(&output->needs_redraw, false, memory_order_relaxed);
     }
     output->frames_rendered++;
 
@@ -1017,28 +1056,29 @@ bool render_frame(struct output_state *output) {
 
         /* Defensive check: ensure multipass shader is actually loaded */
         if (output->multipass_shader == NULL && output->live_shader_program == 0) {
-            /* Track reload attempts to prevent infinite spam */
-            static uint64_t last_reload_attempt_time = 0;
-            static int consecutive_failures = 0;
+            /* Track reload attempts per-output to prevent one bad output from
+             * locking out others. */
             uint64_t current_time = get_time_ms();
 
             /* Only attempt reload once per second max, and give up after 3 failures */
-            if (current_time - last_reload_attempt_time >= 1000 && consecutive_failures < 3) {
+            if (current_time - output->shader_last_reload_attempt_time >= 1000 &&
+                output->shader_consecutive_failures < 3) {
                 log_error("Config type is SHADER but shader program not loaded for output %s",
                          output->model[0] ? output->model : "unknown");
                 log_error("This may happen after config reload. Attempting to reload shader (attempt %d/3)...",
-                         consecutive_failures + 1);
+                         output->shader_consecutive_failures + 1);
 
-                last_reload_attempt_time = current_time;
+                output->shader_last_reload_attempt_time = current_time;
 
                 /* Try to load the shader if we have a path */
                 if (output->config->shader_path[0] != '\0') {
                     output_set_shader(output, output->config->shader_path);
                     if (output->multipass_shader == NULL && output->live_shader_program == 0) {
-                        consecutive_failures++;
-                        log_error("Failed to reload shader (attempt %d/3), skipping frame", consecutive_failures);
+                        output->shader_consecutive_failures++;
+                        log_error("Failed to reload shader (attempt %d/3), skipping frame",
+                                 output->shader_consecutive_failures);
 
-                        if (consecutive_failures >= 3) {
+                        if (output->shader_consecutive_failures >= 3) {
                             log_error("╔═══════════════════════════════════════════════════════════════╗");
                             log_error("║ CRITICAL: Shader failed to load after 3 attempts             ║");
                             log_error("╠═══════════════════════════════════════════════════════════════╣");
@@ -1057,13 +1097,13 @@ bool render_frame(struct output_state *output) {
                         return false;
                     } else {
                         /* Success! Reset failure counter and clear failed flag */
-                        consecutive_failures = 0;
+                        output->shader_consecutive_failures = 0;
                         output->shader_load_failed = false;
                         log_info("Shader successfully reloaded after failure");
                     }
                 } else {
                     log_error("No shader path configured, skipping frame");
-                    consecutive_failures = 3; /* Don't retry if no path */
+                    output->shader_consecutive_failures = 3; /* Don't retry if no path */
                     output->shader_load_failed = true; /* Mark as permanently failed */
                     return false;
                 }
@@ -1217,7 +1257,7 @@ bool render_frame(struct output_state *output) {
     /* Render FPS watermark if enabled */
     render_fps_watermark(output);
 
-    output->needs_redraw = false;
+    atomic_store_explicit(&output->needs_redraw, false, memory_order_relaxed);
     output->frames_rendered++;
 
     return true;

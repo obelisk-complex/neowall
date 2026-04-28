@@ -11,6 +11,7 @@
 
 #include <stddef.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <GL/gl.h>
 #include "neowall.h"
 #include "constants.h"
@@ -263,7 +264,7 @@ void transition_end(transition_context_t *ctx) {
     }
 
     if (ctx->output && !ctx->error_occurred) {
-        ctx->output->needs_redraw = true;
+        atomic_store_explicit(&ctx->output->needs_redraw, true, memory_order_relaxed);
         ctx->output->frames_rendered++;
     }
 }

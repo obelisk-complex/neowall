@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include "neowall.h"
 #include "constants.h"
 
@@ -440,14 +441,37 @@ bool write_wallpaper_state(const char *output_name, const char *wallpaper_path,
         state_count++;
     }
     
-    /* Write all states back to file */
-    FILE *fp_write = fopen(state_path, "w");
-    if (!fp_write) {
-        log_error("Failed to write state file %s: %s", state_path, strerror(errno));
+    /* Atomic write: temp file + rename. Crash mid-write leaves the original
+     * intact. O_EXCL + O_NOFOLLOW guard against symlink TOCTOU. */
+    char tmp_path[MAX_PATH_LENGTH];
+    int written = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d",
+                          state_path, (int)getpid());
+    if (written < 0 || (size_t)written >= sizeof(tmp_path)) {
+        log_error("State temp path too long");
         pthread_mutex_unlock(&state_file_mutex);
         return false;
     }
-    
+    /* Best-effort cleanup of any leftover temp file from a previous crash */
+    unlink(tmp_path);
+
+    int tmp_fd = open(tmp_path,
+                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                      0600);
+    if (tmp_fd < 0) {
+        log_error("Failed to open temp state file %s: %s", tmp_path, strerror(errno));
+        pthread_mutex_unlock(&state_file_mutex);
+        return false;
+    }
+
+    FILE *fp_write = fdopen(tmp_fd, "w");
+    if (!fp_write) {
+        log_error("fdopen of temp state file failed: %s", strerror(errno));
+        close(tmp_fd);
+        unlink(tmp_path);
+        pthread_mutex_unlock(&state_file_mutex);
+        return false;
+    }
+
     for (int i = 0; i < state_count; i++) {
         fprintf(fp_write, "[output]\n");
         fprintf(fp_write, "name=%s\n", states[i].output_name);
@@ -459,8 +483,24 @@ bool write_wallpaper_state(const char *output_name, const char *wallpaper_path,
         fprintf(fp_write, "timestamp=%ld\n", states[i].timestamp);
         fprintf(fp_write, "\n");
     }
-    
+
+    if (fflush(fp_write) != 0) {
+        log_error("fflush of temp state file failed: %s", strerror(errno));
+        fclose(fp_write);
+        unlink(tmp_path);
+        pthread_mutex_unlock(&state_file_mutex);
+        return false;
+    }
     fclose(fp_write);
+
+    if (rename(tmp_path, state_path) != 0) {
+        log_error("Failed to rename %s -> %s: %s",
+                 tmp_path, state_path, strerror(errno));
+        unlink(tmp_path);
+        pthread_mutex_unlock(&state_file_mutex);
+        return false;
+    }
+
     pthread_mutex_unlock(&state_file_mutex);
     return true;
 }
@@ -468,10 +508,15 @@ bool write_wallpaper_state(const char *output_name, const char *wallpaper_path,
 /* Restore cycle index from state file for the given output */
 int restore_cycle_index_from_state(const char *output_name) {
     const char *state_path = get_state_file_path();
-    FILE *fp = fopen(state_path, "r");
-    
-    if (!fp) {
+    int fd = open(state_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
         log_debug("No state file found, starting from index 0");
+        return 0;
+    }
+    FILE *fp = fdopen(fd, "r");
+    if (!fp) {
+        close(fd);
+        log_debug("fdopen of state file failed");
         return 0;
     }
     

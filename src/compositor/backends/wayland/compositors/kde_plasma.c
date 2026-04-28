@@ -249,9 +249,10 @@ static struct compositor_surface *kde_create_surface(void *data,
         wl_region_destroy(opaque_region);
     }
 
-    /* Use BOTTOM layer for KDE - BACKGROUND layer doesn't render properly.
-     * Note: This may cover desktop icons on KDE Plasma. */
-    enum zwlr_layer_shell_v1_layer layer = ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM;
+    /* Plasma 6 supports BACKGROUND properly; BOTTOM with exclusive_zone=-1
+     * triggers immediate `closed` from KWin under strict layer-shell
+     * enforcement (notably on NVIDIA proprietary). */
+    enum zwlr_layer_shell_v1_layer layer = ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND;
 
     /* Create layer surface */
     surface_data->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
@@ -294,8 +295,9 @@ static struct compositor_surface *kde_create_surface(void *data,
                       ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
     zwlr_layer_surface_v1_set_anchor(surface_data->layer_surface, anchor);
 
-    /* Set exclusive zone to -1 (don't reserve space) */
-    zwlr_layer_surface_v1_set_exclusive_zone(surface_data->layer_surface, -1);
+    /* exclusive_zone=0 — wallpaper should not reserve space and should not
+     * extend into reserved zones either. -1 trips KWin 6 strict checks. */
+    zwlr_layer_surface_v1_set_exclusive_zone(surface_data->layer_surface, 0);
 
     /* Disable keyboard interactivity */
     zwlr_layer_surface_v1_set_keyboard_interactivity(surface_data->layer_surface,
@@ -312,23 +314,6 @@ static struct compositor_surface *kde_create_surface(void *data,
         wl_surface_set_input_region(wl_surface, input_region);
         wl_region_destroy(input_region);
         log_info("KDE surface: Empty input region set (clicks pass through)");
-    }
-
-    /* Enable tearing control for immediate presentation */
-    if (wl->tearing_control_manager) {
-        struct wp_tearing_control_v1 *tearing = wp_tearing_control_manager_v1_get_tearing_control(
-            wl->tearing_control_manager,
-            wl_surface
-        );
-        surface->tearing_control = tearing;
-
-        if (tearing) {
-            wp_tearing_control_v1_set_presentation_hint(
-                tearing,
-                WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC
-            );
-            log_debug("KDE surface: Tearing control enabled");
-        }
     }
 
     /* Commit to apply configuration */
