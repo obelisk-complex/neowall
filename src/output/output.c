@@ -458,8 +458,9 @@ static void *preload_thread_func(void *arg) {
     }
 
     output->preload_decoded_image = decoded_image;
-    strncpy(output->preload_path, args->path, sizeof(output->preload_path) - 1);
-    output->preload_path[sizeof(output->preload_path) - 1] = '\0';
+    /* snprintf cleanly truncates and NUL-terminates without GCC's
+     * stringop-truncation warning that strncpy(dst, src, sizeof-1) trips. */
+    snprintf(output->preload_path, sizeof(output->preload_path), "%s", args->path);
 
     pthread_mutex_unlock(&output->preload_mutex);
 
@@ -742,8 +743,9 @@ void output_set_shader(struct output_state *output, const char *shader_path) {
 
     /* Acquire state mutex to safely read model string */
     pthread_mutex_lock(&output->state->state_mutex);
-    strncpy(model_copy, output->model, sizeof(model_copy) - 1);
-    model_copy[sizeof(model_copy) - 1] = '\0';
+    /* snprintf truncates and NUL-terminates without tripping GCC's
+     * -Wstringop-truncation that strncpy(dst, src, sizeof-1) would. */
+    snprintf(model_copy, sizeof(model_copy), "%s", output->model);
     pthread_mutex_unlock(&output->state->state_mutex);
 
     log_info("Setting shader for output %s: %s",
@@ -984,10 +986,10 @@ void output_cycle_wallpaper(struct output_state *output) {
     if (output->config->type == WALLPAPER_SHADER &&
         output->shader_fade_start_time > 0 &&
         output->pending_shader_path[0] != '\0') {
-        /* Use local copy of model to avoid race if output is being modified */
+        /* Use local copy of model to avoid race if output is being modified.
+         * snprintf truncates+NUL-terminates without -Wstringop-truncation. */
         char model_copy[64];
-        strncpy(model_copy, output->model, sizeof(model_copy) - 1);
-        model_copy[sizeof(model_copy) - 1] = '\0';
+        snprintf(model_copy, sizeof(model_copy), "%s", output->model);
         const char *output_name = model_copy[0] ? model_copy : "unknown";
         log_info("Shader transition in progress on output '%s', deferring cycle request",
                  output_name);

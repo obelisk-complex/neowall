@@ -847,45 +847,60 @@ static char *fix_shadertoy_compatibility(const char *source) {
     return result;
 }
 
-/* Wrap a pass source with Shadertoy compatibility layer */
+/* Wrap a pass source with Shadertoy compatibility layer.
+ *
+ * fix_shadertoy_compatibility may expand input (e.g. wraps `iChannelResolution[i]`
+ * with `(...).xy`, adding bytes per match). Earlier code estimated based on
+ * the *input* length and used strcat against that bound, which could overflow
+ * if the expanded source plus prefix/suffix exceeded `total`. Fix: run the
+ * compatibility pass first, then size the buffer from the *actual expanded
+ * lengths* and copy via memcpy. */
 static char *wrap_pass_source(const char *common, const char *pass_source) {
     size_t prefix_len = strlen(multipass_wrapper_prefix);
-    size_t common_len = common ? strlen(common) : 0;
-    size_t pass_len = pass_source ? strlen(pass_source) : 0;
     size_t suffix_len = strlen(multipass_wrapper_suffix);
 
-    /* Extra space for .xy additions (worst case: every iChannelResolution gets .xy) */
-    size_t total = prefix_len + (common_len * 2) + (pass_len * 2) + suffix_len + 64;
-    char *wrapped = malloc(total);
-    if (!wrapped) return NULL;
+    /* Run compat fixups up front so we know the real expanded sizes. */
+    char *fixed_common = NULL;
+    char *fixed_pass = NULL;
+    const char *common_buf = NULL;
+    const char *pass_buf = NULL;
+    size_t common_buf_len = 0;
+    size_t pass_buf_len = 0;
 
-    wrapped[0] = '\0';
-    strcat(wrapped, multipass_wrapper_prefix);
-    
-    /* Apply compatibility fixes to common code */
     if (common) {
-        char *fixed_common = fix_shadertoy_compatibility(common);
-        if (fixed_common) {
-            strcat(wrapped, fixed_common);
-            free(fixed_common);
-        } else {
-            strcat(wrapped, common);
-        }
+        fixed_common = fix_shadertoy_compatibility(common);
+        common_buf = fixed_common ? fixed_common : common;
+        common_buf_len = strlen(common_buf);
     }
-    strcat(wrapped, "\n");
-    
-    /* Apply compatibility fixes to pass source */
     if (pass_source) {
-        char *fixed_pass = fix_shadertoy_compatibility(pass_source);
-        if (fixed_pass) {
-            strcat(wrapped, fixed_pass);
-            free(fixed_pass);
-        } else {
-            strcat(wrapped, pass_source);
-        }
+        fixed_pass = fix_shadertoy_compatibility(pass_source);
+        pass_buf = fixed_pass ? fixed_pass : pass_source;
+        pass_buf_len = strlen(pass_buf);
     }
-    strcat(wrapped, multipass_wrapper_suffix);
 
+    /* +2 for the '\n' separator after common, +1 for terminating NUL, +1 slack. */
+    size_t total = prefix_len + common_buf_len + 2 + pass_buf_len + suffix_len + 2;
+    char *wrapped = malloc(total);
+    if (!wrapped) {
+        free(fixed_common);
+        free(fixed_pass);
+        return NULL;
+    }
+
+    char *p = wrapped;
+    memcpy(p, multipass_wrapper_prefix, prefix_len); p += prefix_len;
+    if (common_buf) {
+        memcpy(p, common_buf, common_buf_len); p += common_buf_len;
+    }
+    *p++ = '\n';
+    if (pass_buf) {
+        memcpy(p, pass_buf, pass_buf_len); p += pass_buf_len;
+    }
+    memcpy(p, multipass_wrapper_suffix, suffix_len); p += suffix_len;
+    *p = '\0';
+
+    free(fixed_common);
+    free(fixed_pass);
     return wrapped;
 }
 

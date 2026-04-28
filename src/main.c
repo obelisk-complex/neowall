@@ -139,7 +139,45 @@ static const char *get_pid_file_path(void) {
     return pid_path;
 }
 
-/* Write PID file */
+/* Read process start-time (jiffies since boot) from /proc/<pid>/stat field 22.
+ * Returns 0 on failure (caller should treat as "unavailable" and skip the
+ * recycling check). The field is unsigned long long. /proc/<pid>/stat has the
+ * format: "pid (comm) state ppid ..." where comm itself may contain spaces and
+ * parentheses, so we parse from the LAST ')' onward to avoid being fooled by
+ * a process named e.g. "weird ) name". */
+static unsigned long long read_proc_starttime(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+
+    char buf[1024];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+
+    char *rparen = strrchr(buf, ')');
+    if (!rparen) return 0;
+    /* Field 3 (state) starts after ") ". After that we want field 22, i.e.
+     * skip 19 more whitespace-delimited tokens (state, ppid ... itrealvalue). */
+    char *p = rparen + 1;
+    for (int i = 0; i < 19; i++) {
+        while (*p == ' ') p++;
+        while (*p && *p != ' ') p++;
+        if (!*p) return 0;
+    }
+    while (*p == ' ') p++;
+    unsigned long long st = 0;
+    if (sscanf(p, "%llu", &st) != 1) return 0;
+    return st;
+}
+
+/* Write PID file. We append the start-time (in /proc clock ticks since boot)
+ * on a second line so subsequent daemon-running checks can detect PID
+ * recycling: if a new process happens to be assigned the same PID after our
+ * daemon dies, its start-time will not match. The second line is optional;
+ * older readers ignore it gracefully. */
 static bool write_pid_file(void) {
     const char *pid_path = get_pid_file_path();
     int fd = open(pid_path,
@@ -157,11 +195,48 @@ static bool write_pid_file(void) {
         return false;
     }
 
-    fprintf(fp, "%d\n", getpid());
+    unsigned long long starttime = read_proc_starttime(getpid());
+    fprintf(fp, "%d\n%llu\n", getpid(), starttime);
     fclose(fp);
 
     log_debug("Created PID file: %s", pid_path);
     return true;
+}
+
+/* Read PID and (optional) start-time from PID file. Returns true on success;
+ * `*out_starttime` is set to 0 if no second line is present. */
+static bool read_pid_file(pid_t *out_pid, unsigned long long *out_starttime) {
+    const char *pid_path = get_pid_file_path();
+    FILE *fp = fopen(pid_path, "r");
+    if (!fp) return false;
+
+    pid_t pid;
+    if (fscanf(fp, "%d", &pid) != 1) {
+        fclose(fp);
+        return false;
+    }
+    unsigned long long st = 0;
+    /* Best-effort: file may pre-date the start-time addition; if absent we
+     * leave `st = 0` and the verify pass falls back to plain kill(0). */
+    if (fscanf(fp, "%llu", &st) != 1) {
+        st = 0;
+    }
+    fclose(fp);
+
+    *out_pid = pid;
+    *out_starttime = st;
+    return true;
+}
+
+/* Verify that the process at `pid` matches the recorded start-time `expected`.
+ * Returns true if the start-time matches OR if /proc is unavailable (we cannot
+ * check, so we fall back to the old kill(0)-style behaviour). Returns false
+ * only when /proc says a different start-time, i.e. PID was recycled. */
+static bool verify_pid_starttime(pid_t pid, unsigned long long expected) {
+    if (expected == 0) return true;  /* No recorded start-time: skip check. */
+    unsigned long long actual = read_proc_starttime(pid);
+    if (actual == 0) return true;    /* /proc unreadable: fall back. */
+    return actual == expected;
 }
 
 /* Remove PID file */
@@ -174,23 +249,28 @@ static void remove_pid_file(void) {
 
 /* Check if daemon is already running */
 static bool is_daemon_running(void) {
-    const char *pid_path = get_pid_file_path();
-    FILE *fp = fopen(pid_path, "r");
-
-    if (!fp) {
-        /* No PID file, daemon not running */
+    pid_t pid;
+    unsigned long long starttime;
+    if (!read_pid_file(&pid, &starttime)) {
+        /* Either no PID file (daemon not running) or unreadable contents.
+         * Distinguish via stat() to keep behaviour: missing -> not running;
+         * present-but-corrupt -> remove and treat as not running. */
+        const char *pid_path = get_pid_file_path();
+        struct stat st;
+        if (stat(pid_path, &st) == 0) {
+            log_debug("Invalid PID file, removing");
+            remove_pid_file();
+        }
         return false;
     }
 
-    pid_t pid;
-    if (fscanf(fp, "%d", &pid) != 1) {
-        fclose(fp);
-        /* Invalid PID file, clean it up */
-        log_debug("Invalid PID file, removing");
+    /* Detect PID recycling: if /proc says the live process at this PID has a
+     * different start-time, our daemon died and its PID was reused. */
+    if (!verify_pid_starttime(pid, starttime)) {
+        log_debug("PID %d was recycled (start-time mismatch), removing stale PID file", pid);
         remove_pid_file();
         return false;
     }
-    fclose(fp);
 
     /* Check if process exists */
     if (kill(pid, 0) == 0) {
@@ -212,20 +292,19 @@ static bool is_daemon_running(void) {
 /* Kill running daemon */
 static bool kill_daemon(void) {
     const char *pid_path = get_pid_file_path();
-    FILE *fp = fopen(pid_path, "r");
-
-    if (!fp) {
+    pid_t pid;
+    unsigned long long starttime;
+    if (!read_pid_file(&pid, &starttime)) {
         printf("No running neowall daemon found (no PID file at %s)\n", pid_path);
         return false;
     }
 
-    pid_t pid;
-    if (fscanf(fp, "%d", &pid) != 1) {
-        fclose(fp);
-        log_error("Failed to read PID from %s", pid_path);
+    /* Refuse to signal a recycled PID. */
+    if (!verify_pid_starttime(pid, starttime)) {
+        printf("PID %d was recycled by another process. Cleaning up stale PID file.\n", pid);
+        remove_pid_file();
         return false;
     }
-    fclose(fp);
 
     /* Check if process exists */
     if (kill(pid, 0) == -1) {
@@ -322,22 +401,20 @@ static bool can_cycle_wallpaper(void) {
 }
 
 static bool send_daemon_signal(int signal, const char *action, bool check_cycle) {
-    const char *pid_path = get_pid_file_path();
-    FILE *fp = fopen(pid_path, "r");
-
-    if (!fp) {
+    pid_t pid;
+    unsigned long long starttime;
+    if (!read_pid_file(&pid, &starttime)) {
         printf("No running neowall daemon found.\n");
         printf("Start the daemon first with: neowall\n");
         return false;
     }
 
-    pid_t pid;
-    if (fscanf(fp, "%d", &pid) != 1) {
-        fclose(fp);
-        log_error("Failed to read PID from %s", pid_path);
+    /* Refuse to signal a recycled PID. */
+    if (!verify_pid_starttime(pid, starttime)) {
+        printf("PID %d was recycled by another process. Cleaning up stale PID file.\n", pid);
+        remove_pid_file();
         return false;
     }
-    fclose(fp);
 
     /* Check if process exists */
     if (kill(pid, 0) == -1) {
@@ -731,23 +808,22 @@ int main(int argc, char *argv[]) {
                 }
             }
             int index = atoi(index_str);
-            
+
             /* Send set-index command to daemon */
-            const char *pid_path = get_pid_file_path();
-            FILE *fp = fopen(pid_path, "r");
-            if (!fp) {
+            pid_t pid;
+            unsigned long long starttime;
+            if (!read_pid_file(&pid, &starttime)) {
                 printf("No running neowall daemon found.\n");
                 printf("Start the daemon first with: neowall\n");
                 return EXIT_FAILURE;
             }
 
-            pid_t pid;
-            if (fscanf(fp, "%d", &pid) != 1) {
-                fclose(fp);
-                fprintf(stderr, "Failed to read PID\n");
+            /* Refuse to signal a recycled PID. */
+            if (!verify_pid_starttime(pid, starttime)) {
+                printf("PID %d was recycled by another process. Cleaning up stale PID file.\n", pid);
+                remove_pid_file();
                 return EXIT_FAILURE;
             }
-            fclose(fp);
 
             /* Check if process exists */
             if (kill(pid, 0) == -1 && errno == ESRCH) {
