@@ -958,16 +958,18 @@ bool render_frame_shader(struct output_state *output) {
     float shader_speed = output->config->shader_speed > 0.0f ? output->config->shader_speed : 1.0f;
     current_time *= shader_speed;
 
-    /* Get mouse position (or use center if not tracked) */
-    float mouse_x = output->mouse_x >= 0 ? output->mouse_x : (float)width / 2.0f;
-    float mouse_y = output->mouse_y >= 0 ? output->mouse_y : (float)height / 2.0f;
-
-    /* Scale mouse reactivity by shader_speed around the screen centre, so a
-     * slow shader reacts gently to cursor motion and a fast one tracks it
-     * fully. Centre = neutral position. */
-    {
-        float cx = (float)width / 2.0f;
-        float cy = (float)height / 2.0f;
+    /* Compute the iMouse value to feed the shader. Real cursor input is
+     * unaffected — this only controls how the SHADER samples the cursor. */
+    float cx = (float)width / 2.0f;
+    float cy = (float)height / 2.0f;
+    float mouse_x, mouse_y;
+    if (!output->config->interactive_mouse) {
+        mouse_x = cx;
+        mouse_y = cy;
+    } else {
+        mouse_x = output->mouse_x >= 0 ? output->mouse_x : cx;
+        mouse_y = output->mouse_y >= 0 ? output->mouse_y : cy;
+        /* Scale by shader_speed around centre: slow shader = gentle camera. */
         mouse_x = cx + (mouse_x - cx) * shader_speed;
         mouse_y = cy + (mouse_y - cy) * shader_speed;
     }

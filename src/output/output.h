@@ -59,6 +59,7 @@ struct wallpaper_config {
     bool vsync;                         /* Enable vsync (sync to monitor refresh, ignores shader_fps) */
     bool show_fps;                      /* Show FPS watermark on screen (default false) */
     bool pause_on_fullscreen;           /* Pause rendering when output is occluded by fullscreen window */
+    bool interactive_mouse;             /* Feed cursor into shader iMouse (default true) */
     bool cycle;                         /* Enable wallpaper cycling */
     char **cycle_paths;                 /* Array of paths for cycling */
     size_t cycle_count;                 /* Number of wallpapers to cycle */

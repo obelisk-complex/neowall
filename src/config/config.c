@@ -484,6 +484,7 @@ static void init_wallpaper_config_defaults(struct wallpaper_config *config) {
     config->vsync = false;  /* Default: vsync off, use custom FPS with tearing control */
     config->show_fps = false;  /* Default: no FPS watermark */
     config->pause_on_fullscreen = false;  /* Default: keep rendering — live wallpaper */
+    config->interactive_mouse = true;     /* Default: cursor drives shader iMouse */
     config->cycle = false;
     config->cycle_paths = NULL;
     config->cycle_count = 0;
@@ -844,6 +845,19 @@ static bool parse_wallpaper_config(VibeValue *obj, struct wallpaper_config *conf
         config->pause_on_fullscreen = pause_fs_val->as_boolean;
         log_info("[%s] Pause on fullscreen: %s", context_name,
                  config->pause_on_fullscreen ? "enabled" : "disabled");
+    }
+
+    /* Parse interactive_mouse */
+    VibeValue *interactive_mouse_val = vibe_object_get(obj->as_object, "interactive_mouse");
+    if (interactive_mouse_val) {
+        if (interactive_mouse_val->type != VIBE_TYPE_BOOLEAN) {
+            log_error("[%s] 'interactive_mouse' must be a boolean (true or false), got type: %d",
+                     context_name, interactive_mouse_val->type);
+            return false;
+        }
+        config->interactive_mouse = interactive_mouse_val->as_boolean;
+        log_info("[%s] Interactive mouse: %s", context_name,
+                 config->interactive_mouse ? "enabled" : "disabled");
     }
 
     /* Parse channels (only relevant for shader mode) */
