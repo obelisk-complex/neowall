@@ -799,7 +799,11 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "\nUse '%s current' to see available wallpapers and their indices.\n", argv[0]);
                 return EXIT_FAILURE;
             }
-            /* Validate index is a number */
+            /* Validate index is a non-negative integer within sensible bounds.
+             * Use strtol so we can detect overflow / out-of-range cleanly;
+             * cap at 65535 which is well above any plausible wallpaper count
+             * and keeps the value safely inside `int` on every supported
+             * platform (atoi has undefined behaviour on overflow). */
             const char *index_str = argv[2];
             for (const char *p = index_str; *p; p++) {
                 if (!isdigit((unsigned char)*p)) {
@@ -807,7 +811,15 @@ int main(int argc, char *argv[]) {
                     return EXIT_FAILURE;
                 }
             }
-            int index = atoi(index_str);
+            errno = 0;
+            char *endp = NULL;
+            long parsed = strtol(index_str, &endp, 10);
+            if (errno == ERANGE || endp == index_str || (endp && *endp != '\0') ||
+                parsed < 0 || parsed > 65535) {
+                fprintf(stderr, "Error: Index out of range (0-65535), got '%s'\n", index_str);
+                return EXIT_FAILURE;
+            }
+            int index = (int)parsed;
 
             /* Send set-index command to daemon */
             pid_t pid;
