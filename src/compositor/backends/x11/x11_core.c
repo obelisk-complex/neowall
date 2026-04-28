@@ -395,6 +395,33 @@ static struct compositor_surface *x11_create_surface(void *backend_data,
         return NULL;
     }
 
+    /* Set EWMH window type to DESKTOP so compositing window managers
+     * (Mutter, Muffin/Cinnamon, KWin, Xfwm) place it as wallpaper rather
+     * than treating an override-redirect surface as a top-level window. */
+    XChangeProperty(backend->x_display, surf_data->x_window,
+                    backend->atom_net_wm_window_type, XA_ATOM, 32,
+                    PropModeReplace,
+                    (unsigned char *)&backend->atom_net_wm_window_type_desktop, 1);
+
+    /* Set EWMH state: below + sticky + skip taskbar + skip pager. */
+    Atom states[4] = {
+        backend->atom_net_wm_state_below,
+        backend->atom_net_wm_state_sticky,
+        backend->atom_net_wm_state_skip_taskbar,
+        backend->atom_net_wm_state_skip_pager,
+    };
+    XChangeProperty(backend->x_display, surf_data->x_window,
+                    backend->atom_net_wm_state, XA_ATOM, 32,
+                    PropModeReplace, (unsigned char *)states, 4);
+
+    /* Hint at no input focus: WM_HINTS with input=False avoids stealing
+     * keyboard focus from the user's apps. */
+    XWMHints wm_hints;
+    memset(&wm_hints, 0, sizeof(wm_hints));
+    wm_hints.flags = InputHint;
+    wm_hints.input = False;
+    XSetWMHints(backend->x_display, surf_data->x_window, &wm_hints);
+
     /* Map and lower the window to bottom of stack */
     XMapWindow(backend->x_display, surf_data->x_window);
     XLowerWindow(backend->x_display, surf_data->x_window);
