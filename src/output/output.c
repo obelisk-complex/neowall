@@ -1054,22 +1054,58 @@ void output_cycle_wallpaper(struct output_state *output) {
 
         log_debug("Image cycled through shader successfully");
     } else {
-        /* Normal cycling mode: change the wallpaper or shader entirely */
+        /* Normal cycling mode: change the wallpaper or shader entirely.
+         * If a shader fails to compile, advance to the NEXT shader instead of
+         * leaving the previous one running (which produced the "neowall next
+         * gives the same shader" symptom). Bounded by cycle_count attempts. */
         const char *type_str = (output->config->type == WALLPAPER_SHADER) ? "shader" : "wallpaper";
-        log_info("Cycling %s for output %s: index %zu->%zu (%zu/%zu): %s",
-                 type_str,
-                 output->model[0] ? output->model : "unknown",
-                 old_index,
-                 output->config->current_cycle_index,
-                 output->config->current_cycle_index + 1,
-                 output->config->cycle_count,
-                 next_path);
+        size_t attempts = 0;
+        size_t max_attempts = output->config->cycle_count;
+        bool applied = false;
 
-        /* Apply the next item based on type */
-        if (output->config->type == WALLPAPER_SHADER) {
-            output_set_shader(output, next_path);
-        } else {
-            output_set_wallpaper(output, next_path);
+        while (attempts < max_attempts) {
+            log_info("Cycling %s for output %s: index %zu->%zu (%zu/%zu): %s",
+                     type_str,
+                     output->model[0] ? output->model : "unknown",
+                     old_index,
+                     output->config->current_cycle_index,
+                     output->config->current_cycle_index + 1,
+                     output->config->cycle_count,
+                     next_path);
+
+            if (output->config->type == WALLPAPER_SHADER) {
+                output_set_shader(output, next_path);
+                if (output->multipass_shader != NULL || output->live_shader_program != 0) {
+                    applied = true;
+                    break;
+                }
+                log_warn("Shader '%s' failed to load; skipping to next in cycle", next_path);
+            } else {
+                output_set_wallpaper(output, next_path);
+                applied = true;
+                break;
+            }
+
+            attempts++;
+            if (attempts >= max_attempts) break;
+
+            /* Advance index again and pick the next path. */
+            pthread_mutex_lock(&output->state->state_mutex);
+            old_index = output->config->current_cycle_index;
+            output->config->current_cycle_index =
+                (output->config->current_cycle_index + 1) % output->config->cycle_count;
+            const char *retry_path =
+                output->config->cycle_paths[output->config->current_cycle_index];
+            strncpy(next_path_copy, retry_path, sizeof(next_path_copy) - 1);
+            next_path_copy[sizeof(next_path_copy) - 1] = '\0';
+            pthread_mutex_unlock(&output->state->state_mutex);
+            next_path = next_path_copy;
+        }
+
+        if (!applied) {
+            log_error("All %zu shaders in the cycle failed to load on output %s",
+                     output->config->cycle_count,
+                     output->model[0] ? output->model : "unknown");
         }
 
         /* Mark the output for redraw to ensure change is visible */
