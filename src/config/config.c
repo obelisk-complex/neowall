@@ -483,7 +483,7 @@ static void init_wallpaper_config_defaults(struct wallpaper_config *config) {
     config->shader_fps = 60;  /* Default 60 FPS for shaders */
     config->vsync = false;  /* Default: vsync off, use custom FPS with tearing control */
     config->show_fps = false;  /* Default: no FPS watermark */
-    config->pause_on_fullscreen = true;  /* Default: pause rendering when occluded */
+    config->pause_on_fullscreen = false;  /* Default: keep rendering — live wallpaper */
     config->cycle = false;
     config->cycle_paths = NULL;
     config->cycle_count = 0;

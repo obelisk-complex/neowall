@@ -191,11 +191,11 @@ transition_duration 1000  # Slow
 Automatically pause rendering when a fullscreen window covers the wallpaper:
 
 ```vibe
-pause_on_fullscreen true    # Pause rendering (default)
-pause_on_fullscreen false   # Keep rendering behind fullscreen apps
+pause_on_fullscreen false   # Keep rendering behind fullscreen apps (default — live wallpaper)
+pause_on_fullscreen true    # Pause rendering when occluded (saves GPU/CPU)
 ```
 
-Saves GPU/CPU when wallpaper isn't visible (e.g. fullscreen games, videos).
+Default is `false` because NeoWall is a live interactive wallpaper. Enable if you'd rather save GPU/CPU when fullscreen games or videos cover the wallpaper.
 
 Works per-output — if only one monitor has a fullscreen window, the other monitors keep rendering.
 

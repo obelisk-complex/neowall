@@ -2,12 +2,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <limits.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/Xrandr.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
+
+/* XRandR 1.5 introduced XRRGetMonitors. Detect via RANDR_MAJOR/MINOR macros
+ * exported by recent libXrandr headers (or RR_Monitor_Major in some distros). */
+#if defined(RANDR_MAJOR) && defined(RANDR_MINOR) && \
+    (RANDR_MAJOR > 1 || (RANDR_MAJOR == 1 && RANDR_MINOR >= 5))
+#define XRANDR_HAS_GET_MONITORS 1
+#elif defined(XRRGetMonitors)
+#define XRANDR_HAS_GET_MONITORS 1
+#endif
 
 /* GL_BGRA is not in GLES3/gl3.h but is available on desktop GL (OpenGL 1.2+).
  * Used for efficient pixel readback matching X11's native BGRA byte order. */
@@ -135,36 +145,82 @@ static bool x11_init_xrandr(x11_backend_data_t *backend) {
     return false;
 }
 
-/* Get actual screen dimensions using XRandR */
-static void x11_get_screen_dimensions(x11_backend_data_t *backend, int *width, int *height) {
+/* Get bounding box covering all active monitors via XRandR */
+static void x11_get_screen_dimensions(x11_backend_data_t *backend,
+                                      int *x, int *y, int *width, int *height) {
     Display *dpy = backend->x_display;
 
-    /* Default to X11 screen dimensions */
+    /* Default to X11 virtual screen dimensions, origin (0, 0) */
+    *x = 0;
+    *y = 0;
     *width = DisplayWidth(dpy, backend->screen);
     *height = DisplayHeight(dpy, backend->screen);
 
-    /* Try to get actual dimensions from XRandR if available */
-    if (backend->has_xrandr) {
+    if (!backend->has_xrandr) {
+        log_info("X11 virtual screen bbox: %d,%d %dx%d (no XRandR)",
+                 *x, *y, *width, *height);
+        return;
+    }
+
+    int min_x = INT_MAX, min_y = INT_MAX;
+    int max_x = INT_MIN, max_y = INT_MIN;
+    int monitor_count = 0;
+
+#ifdef XRANDR_HAS_GET_MONITORS
+    /* Prefer XRandR 1.5 XRRGetMonitors - one entry per logical monitor */
+    int nmonitors = 0;
+    XRRMonitorInfo *monitors = XRRGetMonitors(dpy, backend->root_window, True, &nmonitors);
+    if (monitors && nmonitors > 0) {
+        for (int i = 0; i < nmonitors; i++) {
+            int mx = monitors[i].x;
+            int my = monitors[i].y;
+            int mw = monitors[i].width;
+            int mh = monitors[i].height;
+            if (mw <= 0 || mh <= 0) continue;
+            if (mx < min_x) min_x = mx;
+            if (my < min_y) min_y = my;
+            if (mx + mw > max_x) max_x = mx + mw;
+            if (my + mh > max_y) max_y = my + mh;
+            monitor_count++;
+        }
+        XRRFreeMonitors(monitors);
+    }
+#endif
+
+    if (monitor_count == 0) {
+        /* Fall back to iterating all active CRTCs */
         XRRScreenResources *resources = XRRGetScreenResources(dpy, backend->root_window);
         if (resources) {
-            /* Find the primary output or first active CRTC */
             for (int i = 0; i < resources->ncrtc; i++) {
                 XRRCrtcInfo *crtc_info = XRRGetCrtcInfo(dpy, resources, resources->crtcs[i]);
-                if (crtc_info && crtc_info->mode != None && crtc_info->noutput > 0) {
-                    /* Found an active CRTC - use its dimensions */
-                    *width = crtc_info->width;
-                    *height = crtc_info->height;
-                    log_debug("Using XRandR dimensions: %dx%d", *width, *height);
-                    XRRFreeCrtcInfo(crtc_info);
-                    break;
+                if (!crtc_info) continue;
+                if (crtc_info->mode != None && crtc_info->noutput > 0 &&
+                    crtc_info->width > 0 && crtc_info->height > 0) {
+                    int cx = crtc_info->x;
+                    int cy = crtc_info->y;
+                    int cw = (int)crtc_info->width;
+                    int ch = (int)crtc_info->height;
+                    if (cx < min_x) min_x = cx;
+                    if (cy < min_y) min_y = cy;
+                    if (cx + cw > max_x) max_x = cx + cw;
+                    if (cy + ch > max_y) max_y = cy + ch;
+                    monitor_count++;
                 }
-                if (crtc_info) {
-                    XRRFreeCrtcInfo(crtc_info);
-                }
+                XRRFreeCrtcInfo(crtc_info);
             }
             XRRFreeScreenResources(resources);
         }
     }
+
+    if (monitor_count > 0 && max_x > min_x && max_y > min_y) {
+        *x = min_x;
+        *y = min_y;
+        *width = max_x - min_x;
+        *height = max_y - min_y;
+    }
+
+    log_info("X11 virtual screen bbox: %d,%d %dx%d (monitors: %d)",
+             *x, *y, *width, *height, monitor_count);
 }
 
 /* ============================================================================
@@ -267,15 +323,17 @@ static struct compositor_surface *x11_create_surface(void *backend_data,
         return NULL;
     }
 
-    /* Get screen dimensions using XRandR if available */
-    int screen_width, screen_height;
-    x11_get_screen_dimensions(backend, &screen_width, &screen_height);
+    /* Get virtual screen bounding box covering all monitors */
+    int origin_x = 0, origin_y = 0, screen_width = 0, screen_height = 0;
+    x11_get_screen_dimensions(backend, &origin_x, &origin_y,
+                              &screen_width, &screen_height);
 
     /* Determine surface dimensions from config or output */
     int width = config->width > 0 ? config->width : screen_width;
     int height = config->height > 0 ? config->height : screen_height;
 
-    log_debug("Creating X11 wallpaper window: %dx%d", width, height);
+    log_debug("Creating X11 wallpaper window at %d,%d size %dx%d",
+             origin_x, origin_y, width, height);
 
     /* Create pixmap for root window background (for Conky pseudo-transparency) */
     surf_data->root_pixmap = XCreatePixmap(backend->x_display, backend->root_window,
@@ -320,7 +378,7 @@ static struct compositor_surface *x11_create_surface(void *backend_data,
     surf_data->x_window = XCreateWindow(
         backend->x_display,
         backend->root_window,
-        0, 0,  /* Position at top-left */
+        origin_x, origin_y,  /* Position at virtual-screen bbox origin */
         width, height,
         0,  /* No border */
         CopyFromParent,  /* depth */
