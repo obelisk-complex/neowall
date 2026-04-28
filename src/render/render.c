@@ -962,6 +962,16 @@ bool render_frame_shader(struct output_state *output) {
     float mouse_x = output->mouse_x >= 0 ? output->mouse_x : (float)width / 2.0f;
     float mouse_y = output->mouse_y >= 0 ? output->mouse_y : (float)height / 2.0f;
 
+    /* Scale mouse reactivity by shader_speed around the screen centre, so a
+     * slow shader reacts gently to cursor motion and a fast one tracks it
+     * fully. Centre = neutral position. */
+    {
+        float cx = (float)width / 2.0f;
+        float cy = (float)height / 2.0f;
+        mouse_x = cx + (mouse_x - cx) * shader_speed;
+        mouse_y = cy + (mouse_y - cy) * shader_speed;
+    }
+
     /* Render all passes using multipass system */
     multipass_render(output->multipass_shader,
                      (float)current_time,
