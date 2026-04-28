@@ -311,12 +311,11 @@ char *shader_load_file(const char *path) {
         if (home) {
             snprintf(expanded_path, sizeof(expanded_path), "%s%s", home, resolved_path + 1);
         } else {
-            strncpy(expanded_path, resolved_path, sizeof(expanded_path) - 1);
-            expanded_path[sizeof(expanded_path) - 1] = '\0';
+            /* snprintf truncates+NUL-terminates without -Wstringop-truncation. */
+            snprintf(expanded_path, sizeof(expanded_path), "%s", resolved_path);
         }
     } else {
-        strncpy(expanded_path, resolved_path, sizeof(expanded_path) - 1);
-        expanded_path[sizeof(expanded_path) - 1] = '\0';
+        snprintf(expanded_path, sizeof(expanded_path), "%s", resolved_path);
     }
 
     /* Open file in binary mode to get accurate byte count */

@@ -1330,8 +1330,10 @@ static bool apply_builtin_default_config(struct neowall_state *state) {
             /* Check if it's a file */
             struct stat st;
             if (stat(expanded, &st) == 0 && S_ISREG(st.st_mode) && access(expanded, R_OK) == 0) {
-                strncpy(default_config.path, expanded, sizeof(default_config.path) - 1);
-                default_config.path[sizeof(default_config.path) - 1] = '\0';
+                /* snprintf truncates+NUL-terminates without
+                 * -Wstringop-truncation; matches the cleanup in
+                 * output.c. */
+                snprintf(default_config.path, sizeof(default_config.path), "%s", expanded);
                 log_info("Using default wallpaper: %s", expanded);
                 break;
             }

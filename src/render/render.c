@@ -55,6 +55,13 @@ static const char *color_fragment_shader =
     "}\n";
 
 static GLuint color_overlay_program = 0;
+/* FPS watermark VBO + cached locations: allocated once when the color overlay
+ * program is created, not torn down per-frame. The previous code did
+ * glGenBuffers/glDeleteBuffers (and glGetAttribLocation/glGetUniformLocation)
+ * on every render_fps_watermark call, which is wasteful at 60+ FPS. */
+static GLuint fps_text_vbo = 0;
+static GLint fps_pos_attrib = -1;
+static GLint fps_color_uniform = -1;
 
 /* Simple 5x7 bitmap font for FPS display (digits 0-9, dot, space, and 'FPS') */
 static const uint8_t font_5x7[][7] = {
@@ -131,18 +138,15 @@ static void render_fps_watermark(struct output_state *output) {
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    /* Use color shader */
+    /* Use color shader. Attrib/uniform locations and VBO were captured once
+     * at program creation; reuse them every frame. */
     glUseProgram(color_overlay_program);
-    GLint pos_attrib = glGetAttribLocation(color_overlay_program, "position");
-    GLint color_uniform = glGetUniformLocation(color_overlay_program, "color");
+    GLint pos_attrib = fps_pos_attrib;
+    GLint color_uniform = fps_color_uniform;
 
-    if (pos_attrib < 0 || color_uniform < 0) return;
+    if (pos_attrib < 0 || color_uniform < 0 || fps_text_vbo == 0) return;
 
-    /* Create temporary VBO for text rendering */
-    GLuint text_vbo;
-    glGenBuffers(1, &text_vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, text_vbo);
-
+    glBindBuffer(GL_ARRAY_BUFFER, fps_text_vbo);
     glVertexAttribPointer(pos_attrib, 2, GL_FLOAT, GL_FALSE, 0, 0);
     glEnableVertexAttribArray(pos_attrib);
 
@@ -220,7 +224,8 @@ static void render_fps_watermark(struct output_state *output) {
 
     glDisableVertexAttribArray(pos_attrib);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDeleteBuffers(1, &text_vbo);
+    /* fps_text_vbo lives until the program shuts down (matches the existing
+     * shader_vbo / color_overlay_program lifetime). */
 
     /* Restore GL state */
     if (!blend_enabled) {
@@ -260,6 +265,7 @@ static inline void cache_program_uniforms(struct output_state *output) {
     output->program_uniforms.position = glGetAttribLocation(output->program, "position");
     output->program_uniforms.texcoord = glGetAttribLocation(output->program, "texcoord");
     output->program_uniforms.tex_sampler = glGetUniformLocation(output->program, "texture0");
+    output->program_uniforms.alpha = glGetUniformLocation(output->program, "alpha");
 }
 
 /* Helper: Cache uniform locations for transition shaders */
@@ -328,13 +334,19 @@ bool render_init_output(struct output_state *output) {
     output->channel_count = 0;
     output->shader_uniforms.iChannel = NULL;
 
-    /* Create simple color shader for overlays (once, shared across outputs) */
+    /* Create simple color shader for overlays (once, shared across outputs).
+     * Also allocate the FPS watermark VBO and cache its uniform/attrib
+     * locations here so render_fps_watermark doesn't repeat that work every
+     * frame. */
     if (color_overlay_program == 0) {
         if (!shader_create_program_from_sources(color_vertex_shader, color_fragment_shader, &color_overlay_program)) {
             log_error("Failed to create color overlay shader program");
             return false;
         }
-        log_debug("Created color overlay shader program");
+        fps_pos_attrib = glGetAttribLocation(color_overlay_program, "position");
+        fps_color_uniform = glGetUniformLocation(color_overlay_program, "color");
+        glGenBuffers(1, &fps_text_vbo);
+        log_debug("Created color overlay shader program + FPS watermark VBO");
     }
 
     /* Create shader programs for transitions
@@ -1208,22 +1220,26 @@ bool render_frame(struct output_state *output) {
 
     bind_texture_cached(output, output->texture);
 
-    /* Check if bind succeeded */
+#ifndef NDEBUG
+    /* Check if bind succeeded - debug builds only; glGetError forces a GPU
+     * sync and is wasted work in release. */
     GLenum bind_error = glGetError();
     if (bind_error != GL_NO_ERROR) {
         log_error("OpenGL error binding texture %u: 0x%x", output->texture, bind_error);
         return false;
     }
+#endif
 
     /* Set texture unit uniform - use cached location */
     if (output->program_uniforms.tex_sampler >= 0) {
         glUniform1i(output->program_uniforms.tex_sampler, 0);
     }
 
-    /* Set alpha uniform (for transitions) - lookup once per frame is acceptable */
-    GLint alpha_uniform = glGetUniformLocation(output->program, "alpha");
-    if (alpha_uniform >= 0) {
-        glUniform1f(alpha_uniform, 1.0f);
+    /* Alpha uniform location is cached at program creation alongside
+     * tex_sampler (see cache_program_uniforms). Skip the per-frame
+     * glGetUniformLocation. */
+    if (output->program_uniforms.alpha >= 0) {
+        glUniform1f(output->program_uniforms.alpha, 1.0f);
     }
 
     /* Handle tile mode texture wrapping - only change when needed */
@@ -1247,24 +1263,28 @@ bool render_frame(struct output_state *output) {
     /* Re-enable alpha channel writes */
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-    /* Check for GL errors */
+#ifndef NDEBUG
+    /* Check for GL errors - debug builds only; glGetError forces a sync. */
     GLenum gl_error = glGetError();
     if (gl_error != GL_NO_ERROR) {
         log_error("OpenGL error after draw: 0x%x (display may be disconnected)", gl_error);
         return false;
     }
+#endif
 
     /* Clean up - disable attributes but leave state cached */
     glDisableVertexAttribArray(pos_attrib);
     glDisableVertexAttribArray(tex_attrib);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    /* Check for errors */
+#ifndef NDEBUG
+    /* Check for errors - debug builds only. */
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {
         log_error("OpenGL error during rendering: 0x%x", error);
         return false;
     }
+#endif
 
     /* Render FPS watermark if enabled */
     render_fps_watermark(output);

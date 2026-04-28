@@ -109,6 +109,14 @@ typedef struct {
     GLuint noise_texture;                    /* Default noise texture */
     GLuint keyboard_texture;                 /* Keyboard state texture */
     GLint default_framebuffer;               /* Default framebuffer ID (may not be 0 in GTK) */
+    bool default_framebuffer_dirty;          /* When true, default_framebuffer needs requery (set by multipass_resize) */
+
+    /* Cached iDate vec4: recomputed at most once per second, not per frame.
+     * `idate_last_update_sec` is the wall-clock second at which we last
+     * sampled localtime. */
+    float idate_cache[4];
+    long idate_last_update_sec;
+    bool idate_cache_valid;
     
     /* Resolution scaling */
     float resolution_scale;                  /* Current buffer resolution scale */

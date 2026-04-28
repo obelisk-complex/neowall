@@ -1329,13 +1329,17 @@ bool multipass_init_gl(multipass_shader_t *shader, int width, int height) {
     return true;
 }
 
-/* Cache uniform locations after compilation to avoid glGetUniformLocation per frame */
+/* Cache uniform locations after compilation to avoid glGetUniformLocation per frame.
+ * Also uploads the *constant* uniforms (iTimeDelta, iFrameRate, iSampleRate,
+ * iChannelResolution) once here so they don't need to be re-sent every frame
+ * from multipass_set_uniforms. We keep the program bound for that block, then
+ * leave program-binding state to the renderer's own bookkeeping. */
 static void cache_uniform_locations(multipass_pass_t *pass) {
     if (!pass || !pass->program) return;
-    
+
     GLuint prog = pass->program;
     uniform_locations_t *u = &pass->uniforms;
-    
+
     u->iTime = glGetUniformLocation(prog, "iTime");
     u->iTimeDelta = glGetUniformLocation(prog, "iTimeDelta");
     u->iFrameRate = glGetUniformLocation(prog, "iFrameRate");
@@ -1345,14 +1349,38 @@ static void cache_uniform_locations(multipass_pass_t *pass) {
     u->iDate = glGetUniformLocation(prog, "iDate");
     u->iSampleRate = glGetUniformLocation(prog, "iSampleRate");
     u->iChannelResolution = glGetUniformLocation(prog, "iChannelResolution");
-    
+
     u->iChannel[0] = glGetUniformLocation(prog, "iChannel0");
     u->iChannel[1] = glGetUniformLocation(prog, "iChannel1");
     u->iChannel[2] = glGetUniformLocation(prog, "iChannel2");
     u->iChannel[3] = glGetUniformLocation(prog, "iChannel3");
-    
+
     u->cached = true;
-    
+
+    /* Upload the link-time constants. We must bind the program first because
+     * glUniform* operates on the currently-active program. Save+restore so we
+     * don't disturb whatever the caller had bound. */
+    GLint prev_program = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prev_program);
+    glUseProgram(prog);
+
+    if (u->iTimeDelta >= 0) glUniform1f(u->iTimeDelta, 1.0f / 60.0f);
+    if (u->iFrameRate >= 0) glUniform1f(u->iFrameRate, 60.0f);
+    if (u->iSampleRate >= 0) glUniform1f(u->iSampleRate, 44100.0f);
+    if (u->iChannelResolution >= 0) {
+        static const float resolutions[12] = {
+            256.0f, 256.0f, 1.0f,
+            256.0f, 256.0f, 1.0f,
+            256.0f, 256.0f, 1.0f,
+            256.0f, 256.0f, 1.0f
+        };
+        glUniform3fv(u->iChannelResolution, 4, resolutions);
+    }
+
+    if ((GLuint)prev_program != prog) {
+        glUseProgram((GLuint)prev_program);
+    }
+
     log_debug("Cached uniform locations for %s: iTime=%d, iResolution=%d, iFrame=%d",
               pass->name, u->iTime, u->iResolution, u->iFrame);
 }
@@ -1510,6 +1538,10 @@ bool multipass_compile_all(multipass_shader_t *shader) {
 void multipass_resize(multipass_shader_t *shader, int width, int height) {
     if (!shader || !shader->is_initialized) return;
 
+    /* Mark default framebuffer cache dirty: GTK's GtkGLArea (and other hosts)
+     * can swap the FBO on resize, so the next render must re-query. */
+    shader->default_framebuffer_dirty = true;
+
     /* Calculate base scaled resolution (from adaptive resolution system) */
     int base_scaled_w = (int)(width * shader->resolution_scale);
     int base_scaled_h = (int)(height * shader->resolution_scale);
@@ -1628,10 +1660,10 @@ void multipass_set_uniforms(multipass_shader_t *shader,
     /* Use cached uniform locations for performance */
     const uniform_locations_t *u = &pass->uniforms;
 
-    /* Time uniforms - these change every frame, use direct GL calls */
+    /* Time / frame uniforms change every frame; iTimeDelta, iFrameRate,
+     * iSampleRate, and iChannelResolution are link-time constants now and
+     * uploaded once in cache_uniform_locations. */
     if (u->iTime >= 0) glUniform1f(u->iTime, shader_time);
-    if (u->iTimeDelta >= 0) glUniform1f(u->iTimeDelta, 1.0f / 60.0f);
-    if (u->iFrameRate >= 0) glUniform1f(u->iFrameRate, 60.0f);
     if (u->iFrame >= 0) glUniform1i(u->iFrame, shader->frame_count);
 
     /* Resolution - changes per pass */
@@ -1648,34 +1680,31 @@ void multipass_set_uniforms(multipass_shader_t *shader,
         glUniform4f(u->iMouse, mouse_x, mouse_y, click_x, click_y);
     }
 
-    /* Date - only update if uniform is used (avoid syscall overhead) */
+    /* Date - cached vec4, recomputed at most once per wall-clock second.
+     * Without this cache we paid two syscalls (time, localtime) per pass per
+     * frame even though the value only meaningfully changes once a second. */
     if (u->iDate >= 0) {
-        /* Cache date info - only update once per second would be even better,
-         * but for now just use the cached location */
         time_t t = time(NULL);
-        struct tm *tm_info = localtime(&t);
-        if (tm_info) {
-            float year = (float)(tm_info->tm_year + 1900);
-            float month = (float)(tm_info->tm_mon + 1);
-            float day = (float)tm_info->tm_mday;
-            float seconds = (float)(tm_info->tm_hour * 3600 +
-                                    tm_info->tm_min * 60 +
-                                    tm_info->tm_sec);
-            glUniform4f(u->iDate, year, month, day, seconds);
+        if (!shader->idate_cache_valid || t != shader->idate_last_update_sec) {
+            struct tm *tm_info = localtime(&t);
+            if (tm_info) {
+                shader->idate_cache[0] = (float)(tm_info->tm_year + 1900);
+                shader->idate_cache[1] = (float)(tm_info->tm_mon + 1);
+                shader->idate_cache[2] = (float)tm_info->tm_mday;
+                shader->idate_cache[3] = (float)(tm_info->tm_hour * 3600 +
+                                                 tm_info->tm_min * 60 +
+                                                 tm_info->tm_sec);
+                shader->idate_last_update_sec = (long)t;
+                shader->idate_cache_valid = true;
+            }
         }
-    }
-
-    if (u->iSampleRate >= 0) glUniform1f(u->iSampleRate, 44100.0f);
-
-    /* Channel resolutions - use static data */
-    if (u->iChannelResolution >= 0) {
-        static const float resolutions[12] = {
-            256.0f, 256.0f, 1.0f,
-            256.0f, 256.0f, 1.0f,
-            256.0f, 256.0f, 1.0f,
-            256.0f, 256.0f, 1.0f
-        };
-        glUniform3fv(u->iChannelResolution, 4, resolutions);
+        if (shader->idate_cache_valid) {
+            glUniform4f(u->iDate,
+                        shader->idate_cache[0],
+                        shader->idate_cache[1],
+                        shader->idate_cache[2],
+                        shader->idate_cache[3]);
+        }
     }
 }
 
@@ -1927,11 +1956,16 @@ void multipass_render(multipass_shader_t *shader,
     /* Sync resolution scale from adaptive system */
     shader->resolution_scale = adaptive_get_scale(&shader->adaptive);
 
-    /* Query the CURRENT framebuffer binding every frame
-     * GTK's GtkGLArea can change its FBO on resize, so we must always query */
-    GLint current_fbo = 0;
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &current_fbo);
-    shader->default_framebuffer = current_fbo;
+    /* Query the CURRENT framebuffer binding only when the cache is dirty.
+     * GTK's GtkGLArea can change its FBO on resize, so multipass_resize sets
+     * the dirty flag; otherwise we keep the value captured at init / resize.
+     * This skips a glGetIntegerv per frame in the steady state. */
+    if (shader->default_framebuffer_dirty) {
+        GLint current_fbo = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &current_fbo);
+        shader->default_framebuffer = current_fbo;
+        shader->default_framebuffer_dirty = false;
+    }
 
     log_debug_frame(shader->frame_count, "=== Frame %d ===", shader->frame_count);
 

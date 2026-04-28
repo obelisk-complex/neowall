@@ -333,8 +333,8 @@ bool write_wallpaper_state(const char *output_name, const char *wallpaper_path,
         if (stat(dir_path, &st) == -1) {
             /* Try to create parent first */
             char parent_path[MAX_PATH_LENGTH];
-            strncpy(parent_path, dir_path, sizeof(parent_path) - 1);
-            parent_path[sizeof(parent_path) - 1] = '\0';
+            /* snprintf truncates+NUL-terminates without -Wstringop-truncation. */
+            snprintf(parent_path, sizeof(parent_path), "%s", dir_path);
             char *parent_slash = strrchr(parent_path, '/');
             if (parent_slash) {
                 *parent_slash = '\0';

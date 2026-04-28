@@ -996,8 +996,8 @@ int main(int argc, char *argv[]) {
     atomic_init(&state.set_index_requested, -1);  /* -1 means no request */
     state.timer_fd = -1;
     state.wakeup_fd = -1;
-    strncpy(state.config_path, config_path, sizeof(state.config_path) - 1);
-    state.config_path[sizeof(state.config_path) - 1] = '\0';
+    /* snprintf truncates+NUL-terminates without -Wstringop-truncation. */
+    snprintf(state.config_path, sizeof(state.config_path), "%s", config_path);
     pthread_mutex_init(&state.state_mutex, NULL);
     pthread_rwlock_init(&state.output_list_lock, NULL);
     pthread_mutex_init(&state.state_file_lock, NULL);
