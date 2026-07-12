@@ -77,6 +77,9 @@ typedef struct {
     int xrandr_event_base;
     int xrandr_error_base;
 
+    /* Resolved once at init and applied to every per-monitor window. */
+    bool override_redirect;
+
     bool occlusion_active;
 
     bool initialized;
@@ -119,19 +122,107 @@ static bool x11_init_atoms(x11_backend_data_t *backend) {
     return true;
 }
 
-/* Declare a wallpaper window as the desktop, before it is mapped.
+/* ============================================================================
+ * WINDOW MANAGER DETECTION
+ * ============================================================================ */
+
+/* XGetWindowProperty on the window named by a stale _NET_SUPPORTING_WM_CHECK
+ * raises BadWindow, and Xlib's default error handler terminates the process.
+ * Swallow errors for the duration of the probe. */
+static bool x11_probe_error;
+
+static int x11_probe_error_handler(Display *dpy, XErrorEvent *err) {
+    (void)dpy;
+    (void)err;
+    x11_probe_error = true;
+    return 0;
+}
+
+/* True if an EWMH-compliant window manager owns the screen.
  *
- * EWMH requires _NET_WM_WINDOW_TYPE to be set before the window is mapped, and a
- * client may only set _NET_WM_STATE directly while the window is unmapped; once
- * mapped, state changes must go through the window manager via a _NET_WM_STATE
- * client message.
+ * Two-step _NET_SUPPORTING_WM_CHECK handshake, per EWMH 1.5 ("_NET_SUPPORTING_WM_CHECK"):
+ * the root property names a window, and that window must carry the same property
+ * pointing at itself. A WM that died without cleaning up leaves the root property
+ * behind, so the root alone proves nothing; only the self-referencing child window
+ * proves a WM is still running. */
+static bool x11_ewmh_wm_present(x11_backend_data_t *backend) {
+    Display *dpy = backend->x_display;
+    Atom check = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
+
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long nitems = 0, bytes_after = 0;
+    unsigned char *prop = NULL;
+
+    if (XGetWindowProperty(dpy, backend->root_window, check, 0, 1, False, XA_WINDOW,
+                           &actual_type, &actual_format, &nitems, &bytes_after,
+                           &prop) != Success) {
+        return false;
+    }
+    if (actual_type != XA_WINDOW || actual_format != 32 || nitems != 1 || !prop) {
+        if (prop) XFree(prop);
+        return false;
+    }
+
+    Window wm_window = *(Window *)prop;
+    XFree(prop);
+    prop = NULL;
+
+    if (wm_window == None) {
+        return false;
+    }
+
+    x11_probe_error = false;
+    XErrorHandler prev = XSetErrorHandler(x11_probe_error_handler);
+
+    bool confirmed = false;
+    if (XGetWindowProperty(dpy, wm_window, check, 0, 1, False, XA_WINDOW,
+                           &actual_type, &actual_format, &nitems, &bytes_after,
+                           &prop) == Success &&
+        actual_type == XA_WINDOW && actual_format == 32 && nitems == 1 && prop) {
+        confirmed = (*(Window *)prop == wm_window);
+    }
+    if (prop) XFree(prop);
+
+    XSync(dpy, False);  /* Flush any BadWindow before restoring the handler. */
+    XSetErrorHandler(prev);
+
+    return confirmed && !x11_probe_error;
+}
+
+/* Decide how the per-monitor wallpaper windows are created.
  *
- * The wallpaper windows are override-redirect, so no window manager reads these
- * properties today and setting them changes nothing about how the window is
- * stacked or drawn. They are set because they are the properties the window is
- * meant to carry: the atoms are already interned for exactly this purpose, and
- * anything that does inspect the window (a pager, a screenshot tool, a future
- * managed-window path) then finds the correct hints rather than none at all. */
+ * An override-redirect window is by definition not managed by the window manager,
+ * so the WM never reads its _NET_WM_WINDOW_TYPE and the DESKTOP hint has no effect.
+ * With an EWMH window manager running we therefore want a *managed* window, so the
+ * WM sees _NET_WM_WINDOW_TYPE_DESKTOP and stacks it as the desktop. With no WM
+ * (bare X, or a WM that ignores EWMH) nothing would stack the window for us, so we
+ * keep override-redirect and rely on XLowerWindow as before.
+ *
+ * NEOWALL_X11_OVERRIDE_REDIRECT=1 forces override-redirect, =0 forces a managed
+ * window, as an escape hatch for WMs that mis-handle the auto-detected choice. */
+static bool x11_use_override_redirect(x11_backend_data_t *backend) {
+    const char *env = getenv("NEOWALL_X11_OVERRIDE_REDIRECT");
+    if (env && (env[0] == '0' || env[0] == '1') && env[1] == '\0') {
+        bool forced = (env[0] == '1');
+        log_info("X11: NEOWALL_X11_OVERRIDE_REDIRECT=%s, forcing %s wallpaper window",
+                 env, forced ? "override-redirect" : "managed");
+        return forced;
+    }
+
+    if (x11_ewmh_wm_present(backend)) {
+        log_info("X11: EWMH window manager detected - using managed wallpaper windows");
+        return false;
+    }
+
+    log_info("X11: no EWMH window manager - using override-redirect wallpaper windows");
+    return true;
+}
+
+/* Declare the wallpaper window as the desktop, before it is mapped. EWMH requires
+ * _NET_WM_WINDOW_TYPE to be set before the window is mapped, and the client may
+ * only set _NET_WM_STATE directly while the window is unmapped; once mapped, state
+ * changes must go through the WM via a _NET_WM_STATE client message. */
 static void x11_set_wallpaper_properties(x11_backend_data_t *backend, Window window) {
     Display *dpy = backend->x_display;
 
@@ -148,6 +239,13 @@ static void x11_set_wallpaper_properties(x11_backend_data_t *backend, Window win
     XChangeProperty(dpy, window, backend->atom_net_wm_state, XA_ATOM, 32,
                     PropModeReplace, (unsigned char *)states,
                     (int)(sizeof(states) / sizeof(states[0])));
+
+    /* input=False: the wallpaper must never take keyboard focus from real apps. */
+    XWMHints wm_hints;
+    memset(&wm_hints, 0, sizeof(wm_hints));
+    wm_hints.flags = InputHint;
+    wm_hints.input = False;
+    XSetWMHints(dpy, window, &wm_hints);
 }
 
 /* ============================================================================
@@ -246,6 +344,9 @@ static void *x11_backend_init(struct neowall_state *state) {
 
     /* Initialize XRandR */
     x11_init_xrandr(backend);
+
+    /* Probe the WM once; every per-monitor window is created the same way. */
+    backend->override_redirect = x11_use_override_redirect(backend);
 
     backend->initialized = true;
 
@@ -356,7 +457,7 @@ static struct compositor_surface *x11_create_surface(void *backend_data,
 
     /* Create a fullscreen window at the bottom of the stack */
     XSetWindowAttributes attrs;
-    attrs.override_redirect = True;  /* Bypass WM completely */
+    attrs.override_redirect = backend->override_redirect ? True : False;
     attrs.background_pixel = BlackPixel(backend->x_display, backend->screen);
     attrs.border_pixel = 0;
     attrs.event_mask = ExposureMask | StructureNotifyMask |
@@ -382,28 +483,34 @@ static struct compositor_surface *x11_create_surface(void *backend_data,
         return NULL;
     }
 
-    /* Must precede XMapWindow: EWMH hints are read at map time. */
+    /* Must precede XMapWindow: EWMH hints on an already-mapped window are not
+     * read by the WM at map time. */
     x11_set_wallpaper_properties(backend, surf_data->x_window);
 
     /* Map and lower the window to bottom of stack */
     XMapWindow(backend->x_display, surf_data->x_window);
     XLowerWindow(backend->x_display, surf_data->x_window);
 
-    /* Raise all other windows above this one */
-    Window root_return, parent_return;
-    Window *children = NULL;
-    unsigned int nchildren = 0;
+    /* Only meaningful without a WM. A managed window may be reparented into a
+     * frame, so the root's children are the WM's frames - raising them all would
+     * fight the WM's own stacking of the desktop window. */
+    if (backend->override_redirect) {
+        /* Raise all other windows above this one */
+        Window root_return, parent_return;
+        Window *children = NULL;
+        unsigned int nchildren = 0;
 
-    if (XQueryTree(backend->x_display, backend->root_window, &root_return,
-                   &parent_return, &children, &nchildren)) {
-        /* Raise all windows except our wallpaper window */
-        for (unsigned int i = 0; i < nchildren; i++) {
-            if (children[i] != surf_data->x_window) {
-                XRaiseWindow(backend->x_display, children[i]);
+        if (XQueryTree(backend->x_display, backend->root_window, &root_return,
+                       &parent_return, &children, &nchildren)) {
+            /* Raise all windows except our wallpaper window */
+            for (unsigned int i = 0; i < nchildren; i++) {
+                if (children[i] != surf_data->x_window) {
+                    XRaiseWindow(backend->x_display, children[i]);
+                }
             }
-        }
-        if (children) {
-            XFree(children);
+            if (children) {
+                XFree(children);
+            }
         }
     }
 
