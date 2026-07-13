@@ -20,6 +20,7 @@
 #include "neowall/config/config.h"
 #include "x11_occlusion.h"
 #include "x11_geometry.h"
+#include "x11_wm_detect.h"
 #include "neowall/output/output.h"
 
 /*
@@ -71,14 +72,37 @@ typedef struct {
     Atom atom_net_wm_state_sticky;
     Atom atom_net_wm_state_skip_taskbar;
     Atom atom_net_wm_state_skip_pager;
+    Atom atom_net_wm_desktop;
+    Atom atom_net_wm_name;
+    Atom atom_utf8_string;
+    Atom atom_net_supporting_wm_check;
 
     /* XRandR support */
     bool has_xrandr;
     int xrandr_event_base;
     int xrandr_error_base;
 
-    /* Resolved once at init and applied to every per-monitor window. */
+    /* How every per-monitor window is currently created. Resolved at init, and
+     * revised if a window manager appears later (see x11_recheck_wm). */
     bool override_redirect;
+
+    /* NEOWALL_X11_OVERRIDE_REDIRECT pinned the choice: never auto-revise it. */
+    bool or_env_forced;
+
+    /* Result of the last _NET_SUPPORTING_WM_CHECK probe, so a PropertyNotify
+     * that does not change the answer costs nothing. */
+    bool wm_present;
+
+    /* When the WM went away, the time (ms) at which we stop giving it the benefit
+     * of the doubt and rebuild on the override-redirect path. 0 = nothing pending.
+     * Debounces a WM restart, which flaps the property down and back up. */
+    uint64_t wm_gone_deadline_ms;
+
+    /* The window named by _NET_SUPPORTING_WM_CHECK at the last successful probe.
+     * We select StructureNotifyMask on it so that its DestroyNotify tells us the
+     * WM has gone: a WM killed outright (kill -9, crash) does not clean up the
+     * root property, so waiting for a PropertyNotify would wait forever. */
+    Window wm_check_window;
 
     bool occlusion_active;
 
@@ -119,6 +143,16 @@ static bool x11_init_atoms(x11_backend_data_t *backend) {
     backend->atom_net_wm_state_skip_taskbar = XInternAtom(dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
     backend->atom_net_wm_state_skip_pager = XInternAtom(dpy, "_NET_WM_STATE_SKIP_PAGER", False);
 
+    /* Desktop placement + name, for the managed path. */
+    backend->atom_net_wm_desktop = XInternAtom(dpy, "_NET_WM_DESKTOP", False);
+    backend->atom_net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
+    backend->atom_utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
+
+    /* Interned once, not per-probe: the probe re-runs on every root
+     * PropertyNotify naming this atom. */
+    backend->atom_net_supporting_wm_check =
+        XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
+
     return true;
 }
 
@@ -128,7 +162,21 @@ static bool x11_init_atoms(x11_backend_data_t *backend) {
 
 /* XGetWindowProperty on the window named by a stale _NET_SUPPORTING_WM_CHECK
  * raises BadWindow, and Xlib's default error handler terminates the process.
- * Swallow errors for the duration of the probe. */
+ * Swallow errors for the duration of the probe.
+ *
+ * THREADING CONSTRAINT: XSetErrorHandler is process-global, not per-Display.
+ * Xlib keeps exactly one handler pointer for the whole process, so the
+ * save/install/restore dance below is only safe because nothing else in the
+ * process can be making X requests concurrently: compositor_backend_init()
+ * (and hence every call to this probe that runs at startup) completes before
+ * the first pthread_create() in the codebase. The re-probe on the no-WM -> WM
+ * edge runs later, but on the event-loop thread, which is the only thread that
+ * touches this Display.
+ *
+ * If a future change spawns a thread that makes X requests, or moves backend
+ * init after thread spawn, this becomes a race: the other thread's errors would
+ * be swallowed for the probe's duration, and its own handler could be clobbered.
+ * Either keep that invariant or move to a per-probe Display connection. */
 static bool x11_probe_error;
 
 static int x11_probe_error_handler(Display *dpy, XErrorEvent *err) {
@@ -138,23 +186,17 @@ static int x11_probe_error_handler(Display *dpy, XErrorEvent *err) {
     return 0;
 }
 
-/* True if an EWMH-compliant window manager owns the screen.
- *
- * Two-step _NET_SUPPORTING_WM_CHECK handshake, per EWMH 1.5 ("_NET_SUPPORTING_WM_CHECK"):
- * the root property names a window, and that window must carry the same property
- * pointing at itself. A WM that died without cleaning up leaves the root property
- * behind, so the root alone proves nothing; only the self-referencing child window
- * proves a WM is still running. */
-static bool x11_ewmh_wm_present(x11_backend_data_t *backend) {
-    Display *dpy = backend->x_display;
-    Atom check = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
-
+/* Read one XA_WINDOW-typed property naming a single window. Returns true if the
+ * property is present with the expected type/format/count, and writes the window
+ * it names to *out. */
+static bool x11_read_window_prop(Display *dpy, Window target, Atom prop_atom,
+                                 unsigned long *out) {
     Atom actual_type = None;
     int actual_format = 0;
     unsigned long nitems = 0, bytes_after = 0;
     unsigned char *prop = NULL;
 
-    if (XGetWindowProperty(dpy, backend->root_window, check, 0, 1, False, XA_WINDOW,
+    if (XGetWindowProperty(dpy, target, prop_atom, 0, 1, False, XA_WINDOW,
                            &actual_type, &actual_format, &nitems, &bytes_after,
                            &prop) != Success) {
         return false;
@@ -164,66 +206,113 @@ static bool x11_ewmh_wm_present(x11_backend_data_t *backend) {
         return false;
     }
 
-    Window wm_window = *(Window *)prop;
+    *out = (unsigned long)*(Window *)prop;
     XFree(prop);
-    prop = NULL;
-
-    if (wm_window == None) {
-        return false;
-    }
-
-    x11_probe_error = false;
-    XErrorHandler prev = XSetErrorHandler(x11_probe_error_handler);
-
-    bool confirmed = false;
-    if (XGetWindowProperty(dpy, wm_window, check, 0, 1, False, XA_WINDOW,
-                           &actual_type, &actual_format, &nitems, &bytes_after,
-                           &prop) == Success &&
-        actual_type == XA_WINDOW && actual_format == 32 && nitems == 1 && prop) {
-        confirmed = (*(Window *)prop == wm_window);
-    }
-    if (prop) XFree(prop);
-
-    XSync(dpy, False);  /* Flush any BadWindow before restoring the handler. */
-    XSetErrorHandler(prev);
-
-    return confirmed && !x11_probe_error;
+    return true;
 }
 
-/* Decide how the per-monitor wallpaper windows are created.
+/* True if an EWMH-compliant window manager owns the screen.
  *
- * An override-redirect window is by definition not managed by the window manager,
- * so the WM never reads its _NET_WM_WINDOW_TYPE and the DESKTOP hint has no effect.
- * With an EWMH window manager running we therefore want a *managed* window, so the
- * WM sees _NET_WM_WINDOW_TYPE_DESKTOP and stacks it as the desktop. With no WM
- * (bare X, or a WM that ignores EWMH) nothing would stack the window for us, so we
- * keep override-redirect and rely on XLowerWindow as before.
+ * Gathers the two-step _NET_SUPPORTING_WM_CHECK handshake (EWMH 1.5) from the X
+ * server; the decision made from those facts is x11_ewmh_wm_check_decide(), in
+ * x11_wm_detect.c, so it can be unit-tested without an X server. */
+static bool x11_ewmh_wm_present(x11_backend_data_t *backend) {
+    Display *dpy = backend->x_display;
+    Atom check = backend->atom_net_supporting_wm_check;
+
+    x11_wm_check_obs_t obs;
+    memset(&obs, 0, sizeof(obs));
+
+    obs.root_prop_valid =
+        x11_read_window_prop(dpy, backend->root_window, check, &obs.root_names);
+
+    /* Only the second read can touch a window that may not exist, so only it
+     * needs the error handler. */
+    bool present = false;
+    if (obs.root_prop_valid && obs.root_names != 0) {
+        x11_probe_error = false;
+        XErrorHandler prev = XSetErrorHandler(x11_probe_error_handler);
+
+        obs.child_prop_valid =
+            x11_read_window_prop(dpy, (Window)obs.root_names, check, &obs.child_names);
+
+        obs.x_error = x11_probe_error;
+        present = x11_ewmh_wm_check_decide(&obs);
+
+        /* Watch the WM's check window die. A WM that is killed outright leaves the
+         * root property behind, so its death produces no PropertyNotify — this
+         * DestroyNotify is the only event that tells us. Selecting input on
+         * another client's window is fine (StructureNotify is not exclusive); it
+         * races with the window being destroyed, hence the error handler, which is
+         * still installed here. */
+        if (present) {
+            backend->wm_check_window = (Window)obs.root_names;
+            XSelectInput(dpy, backend->wm_check_window, StructureNotifyMask);
+        }
+
+        XSync(dpy, False);  /* Flush any BadWindow before restoring the handler. */
+        XSetErrorHandler(prev);
+
+        /* If selecting input raced the window's destruction, the WM is already
+         * gone; do not report it as live. */
+        if (present && x11_probe_error) {
+            present = false;
+            backend->wm_check_window = None;
+        }
+    }
+
+    if (!present) {
+        backend->wm_check_window = None;
+    }
+    return present;
+}
+
+/* Decide how the per-monitor wallpaper windows are created, and record whether
+ * the env var pinned that choice (which disables the later heal).
  *
  * NEOWALL_X11_OVERRIDE_REDIRECT=1 forces override-redirect, =0 forces a managed
- * window, as an escape hatch for WMs that mis-handle the auto-detected choice. */
+ * window, as an escape hatch for WMs that mis-handle the auto-detected choice.
+ * Any other value is a mistake and is reported rather than silently ignored. */
 static bool x11_use_override_redirect(x11_backend_data_t *backend) {
     const char *env = getenv("NEOWALL_X11_OVERRIDE_REDIRECT");
-    if (env && (env[0] == '0' || env[0] == '1') && env[1] == '\0') {
-        bool forced = (env[0] == '1');
+    x11_or_env_t mode = x11_or_env_parse(env);
+
+    if (mode == X11_OR_ENV_INVALID) {
+        log_warn("X11: NEOWALL_X11_OVERRIDE_REDIRECT=\"%s\" is not recognised "
+                 "(expected \"0\" for a managed window or \"1\" for "
+                 "override-redirect) - ignoring it and auto-detecting", env);
+    }
+
+    backend->or_env_forced = x11_or_env_is_forced(mode);
+    backend->wm_present = x11_ewmh_wm_present(backend);
+
+    bool override_redirect = x11_or_decide(mode, backend->wm_present);
+
+    if (backend->or_env_forced) {
         log_info("X11: NEOWALL_X11_OVERRIDE_REDIRECT=%s, forcing %s wallpaper window",
-                 env, forced ? "override-redirect" : "managed");
-        return forced;
-    }
-
-    if (x11_ewmh_wm_present(backend)) {
+                 env, override_redirect ? "override-redirect" : "managed");
+    } else if (backend->wm_present) {
         log_info("X11: EWMH window manager detected - using managed wallpaper windows");
-        return false;
+    } else {
+        log_info("X11: no EWMH window manager - using override-redirect wallpaper "
+                 "windows (will switch to managed if one appears)");
     }
 
-    log_info("X11: no EWMH window manager - using override-redirect wallpaper windows");
-    return true;
+    return override_redirect;
 }
 
 /* Declare the wallpaper window as the desktop, before it is mapped. EWMH requires
  * _NET_WM_WINDOW_TYPE to be set before the window is mapped, and the client may
  * only set _NET_WM_STATE directly while the window is unmapped; once mapped, state
- * changes must go through the WM via a _NET_WM_STATE client message. */
-static void x11_set_wallpaper_properties(x11_backend_data_t *backend, Window window) {
+ * changes must go through the WM via a _NET_WM_STATE client message.
+ *
+ * Everything here is set on both the managed and the override-redirect path. A
+ * WM does not read properties off an override-redirect window, so on that path
+ * they are inert — but they are also free, and setting them unconditionally
+ * means the heal path (x11_recreate_surfaces) has one window-setup path to get
+ * right instead of two. */
+static void x11_set_wallpaper_properties(x11_backend_data_t *backend, Window window,
+                                         int pos_x, int pos_y, int width, int height) {
     Display *dpy = backend->x_display;
 
     XChangeProperty(dpy, window, backend->atom_net_wm_window_type, XA_ATOM, 32,
@@ -239,6 +328,54 @@ static void x11_set_wallpaper_properties(x11_backend_data_t *backend, Window win
     XChangeProperty(dpy, window, backend->atom_net_wm_state, XA_ATOM, 32,
                     PropModeReplace, (unsigned char *)states,
                     (int)(sizeof(states) / sizeof(states[0])));
+
+    /* EWMH 5.5 / 9.2: a desktop window belongs on every desktop, which is what
+     * 0xFFFFFFFF means. _NET_WM_STATE_STICKY above is not the same thing — it
+     * means "fixed relative to the viewport", i.e. it does not scroll with a
+     * large desktop, and says nothing about which desktops the window is on. A
+     * format-32 property is passed to Xlib as an array of long. */
+    unsigned long all_desktops = 0xFFFFFFFFUL;
+    XChangeProperty(dpy, window, backend->atom_net_wm_desktop, XA_CARDINAL, 32,
+                    PropModeReplace, (unsigned char *)&all_desktops, 1);
+
+    /* ICCCM 4.1.2.5: WM_CLASS "must be present when the window leaves the
+     * Withdrawn state". An override-redirect window is never managed, so it was
+     * exempt; a managed wallpaper window is not. This is also the handle a user
+     * needs to write a WM rule against us if our stacking misbehaves on their
+     * WM (i3 `for_window [class="NeoWall"]`, KWin window rules, openbox
+     * `<application class="NeoWall">`). */
+    XClassHint class_hint = {
+        .res_name = (char *)"neowall",   /* instance name */
+        .res_class = (char *)"NeoWall",  /* class name */
+    };
+    XSetClassHint(dpy, window, &class_hint);
+
+    /* WM_NAME (ICCCM, latin-1) and _NET_WM_NAME (EWMH, UTF-8). EWMH says a WM
+     * must prefer _NET_WM_NAME where both are present; pagers and `xprop` read
+     * either, so set both. */
+    static const char wm_name[] = "NeoWall Wallpaper";
+    XStoreName(dpy, window, wm_name);
+    XChangeProperty(dpy, window, backend->atom_net_wm_name, backend->atom_utf8_string,
+                    8, PropModeReplace, (const unsigned char *)wm_name,
+                    (int)(sizeof(wm_name) - 1));
+
+    /* ICCCM 4.1.2.3: for a managed window the geometry passed to XCreateWindow is
+     * only a request, and without PPosition the WM is free to place the window by
+     * its own policy. We create one window per monitor at that monitor's origin,
+     * so being placed anywhere else puts the wrong wallpaper on the wrong screen.
+     * PPosition/PSize say the position and size are ours, not the WM's.
+     *
+     * Deliberately no PMinSize/PMaxSize: the window is resized on RandR changes
+     * (x11_configure_surface), and pinning min == max here would leave stale hints
+     * fighting that. */
+    XSizeHints size_hints;
+    memset(&size_hints, 0, sizeof(size_hints));
+    size_hints.flags = PPosition | PSize;
+    size_hints.x = pos_x;
+    size_hints.y = pos_y;
+    size_hints.width = width;
+    size_hints.height = height;
+    XSetWMNormalHints(dpy, window, &size_hints);
 
     /* input=False: the wallpaper must never take keyboard focus from real apps. */
     XWMHints wm_hints;
@@ -345,7 +482,19 @@ static void *x11_backend_init(struct neowall_state *state) {
     /* Initialize XRandR */
     x11_init_xrandr(backend);
 
-    /* Probe the WM once; every per-monitor window is created the same way. */
+    /* Watch the root for _NET_SUPPORTING_WM_CHECK appearing or changing, so a
+     * window manager that starts *after* us is noticed. A wallpaper daemon is
+     * autostarted at login and routinely wins that race; probing once at init and
+     * never looking again would leave us override-redirect for the whole session,
+     * painting over every window the WM later maps.
+     *
+     * No other code in the process selects a core event mask on the root
+     * (XRRSelectInput sets the RandR extension's own mask, which is separate), so
+     * this does not clobber anyone else's selection. */
+    XSelectInput(backend->x_display, backend->root_window, PropertyChangeMask);
+
+    /* Probe the WM; every per-monitor window is created the same way. Re-run on
+     * the root PropertyNotify above (see x11_recheck_wm). */
     backend->override_redirect = x11_use_override_redirect(backend);
 
     backend->initialized = true;
@@ -485,7 +634,8 @@ static struct compositor_surface *x11_create_surface(void *backend_data,
 
     /* Must precede XMapWindow: EWMH hints on an already-mapped window are not
      * read by the WM at map time. */
-    x11_set_wallpaper_properties(backend, surf_data->x_window);
+    x11_set_wallpaper_properties(backend, surf_data->x_window,
+                                 pos_x, pos_y, width, height);
 
     /* Map and lower the window to bottom of stack */
     XMapWindow(backend->x_display, surf_data->x_window);
@@ -1424,6 +1574,190 @@ static void x11_reconcile_outputs(x11_backend_data_t *backend) {
 
 
 /* ============================================================================
+ * WM APPEARED LATE (heal override-redirect -> managed)
+ * ============================================================================ */
+
+/* Destroy and rebuild every wallpaper window with the current
+ * backend->override_redirect.
+ *
+ * The window has to be *recreated*, not re-propertied: override_redirect is a
+ * window attribute fixed at XCreateWindow time. XChangeWindowAttributes can set
+ * it on a mapped window, but the WM decided whether to manage the window when it
+ * saw the MapRequest (or, for an override-redirect window, when it saw the
+ * MapNotify it was told to ignore), so flipping the attribute afterwards does not
+ * retroactively hand the window to the WM.
+ *
+ * The EGL *context* is a single shared state->egl_context, not one per surface;
+ * only the EGLSurface is tied to the native window. So destroying the EGLSurface
+ * and the X window and rebuilding both keeps every GL object — textures, shader
+ * programs, VAOs — alive in the context. No re-upload, no re-compile, and hence
+ * no call to output_init_render() here (unlike the hotplug path, which is
+ * building a brand-new output_state that has no render state yet).
+ *
+ * Runs on the event-loop thread, which owns the EGL context, so the GL work is
+ * safe inline. Same thread and same teardown order as the hotplug reconcile.
+ * Caller must NOT hold output_list_lock. */
+static void x11_recreate_surfaces(x11_backend_data_t *backend) {
+    struct neowall_state *state = backend->state;
+    if (!state) return;
+
+    /* Snapshot the list under the read lock, with a ref on each output; the
+     * rebuild below runs without the lock. */
+    struct output_state *outs[MAX_OUTPUTS];
+    int n = 0;
+    pthread_rwlock_rdlock(&state->output_list_lock);
+    for (struct output_state *o = state->outputs; o && n < MAX_OUTPUTS; o = o->next) {
+        output_ref(o);
+        outs[n++] = o;
+    }
+    pthread_rwlock_unlock(&state->output_list_lock);
+
+    for (int i = 0; i < n; i++) {
+        struct output_state *o = outs[i];
+
+        /* Release the EGL surface from this thread before destroying it. */
+        egl_core_make_current(state, NULL);
+
+        if (o->compositor_surface) {
+            if (o->compositor_surface->egl_surface != EGL_NO_SURFACE) {
+                compositor_surface_destroy_egl(o->compositor_surface, state->egl_display);
+            }
+            compositor_surface_destroy(o->compositor_surface);
+            o->compositor_surface = NULL;
+        }
+
+        if (!x11_attach_surface(state, o) ||
+            !output_create_egl_surface(o) ||
+            !egl_core_make_current(state, o)) {
+            log_error("X11: failed to recreate wallpaper window for %s",
+                      o->connector_name);
+            output_unref(o);
+            continue;
+        }
+
+        atomic_store_explicit(&o->needs_redraw, true, memory_order_release);
+        log_info("X11: wallpaper window for %s recreated as %s",
+                 o->connector_name,
+                 backend->override_redirect ? "override-redirect" : "managed");
+        output_unref(o);
+    }
+}
+
+/* Mark the output that owns an X window for redraw.
+ *
+ * An X11 window does not retain its contents: when it is obscured, restacked,
+ * reparented into (or out of) a WM frame, or remapped, whatever was drawn is
+ * discarded and the server sends Expose. A shader wallpaper repaints every frame
+ * anyway, but a static image is drawn once and then needs_redraw is cleared
+ * (eventloop.c), so without this the window stays black for the rest of the
+ * session. Observed on Xvfb: a static wallpaper goes black the moment the WM
+ * takes the window over, and again when the WM dies. */
+static void x11_mark_window_dirty(x11_backend_data_t *backend, Window window) {
+    struct neowall_state *state = backend->state;
+    if (!state) return;
+
+    pthread_rwlock_rdlock(&state->output_list_lock);
+    for (struct output_state *o = state->outputs; o; o = o->next) {
+        if (!o->compositor_surface) continue;
+        x11_surface_data_t *sd = o->compositor_surface->backend_data;
+        if (sd && sd->x_window == window) {
+            atomic_store_explicit(&o->needs_redraw, true, memory_order_release);
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&state->output_list_lock);
+}
+
+/* Act on the current WM state: rebuild the wallpaper windows if the world no
+ * longer matches how they were created. Idempotent. */
+static void x11_apply_wm_transition(x11_backend_data_t *backend) {
+    x11_wm_action_t action = x11_wm_transition(backend->or_env_forced,
+                                               backend->override_redirect,
+                                               backend->wm_present);
+    switch (action) {
+        case X11_WM_ACTION_RECREATE_MANAGED:
+            log_info("X11: EWMH window manager appeared - recreating wallpaper "
+                     "windows as managed");
+            backend->override_redirect = false;
+            x11_recreate_surfaces(backend);
+            break;
+
+        case X11_WM_ACTION_RECREATE_OVERRIDE:
+            /* Observed on Xvfb (metacity, and a reparenting test WM): when the WM
+             * dies the wallpaper window's contents are lost, and with a static
+             * image needs_redraw has already been cleared, so nothing ever
+             * repaints it — the wallpaper stays black. Rebuilding on the
+             * override-redirect path restores the no-WM setup (XLowerWindow plus
+             * the raise-the-other-children loop) and repaints. */
+            log_info("X11: EWMH window manager went away - recreating wallpaper "
+                     "windows as override-redirect");
+            backend->override_redirect = true;
+            x11_recreate_surfaces(backend);
+            break;
+
+        case X11_WM_ACTION_NONE:
+        default:
+            break;
+    }
+}
+
+/* Re-run the WM probe after _NET_SUPPORTING_WM_CHECK changed on the root.
+ *
+ * The WM-appeared edge is acted on at once. The WM-went-away edge is deferred by
+ * X11_WM_GONE_DEBOUNCE_MS and re-checked in x11_dispatch_events, so a WM restart
+ * (which flaps the property down and straight back up) does not destroy and
+ * recreate every window twice. */
+static void x11_recheck_wm(x11_backend_data_t *backend) {
+    bool wm_now = x11_ewmh_wm_present(backend);
+
+    if (wm_now == backend->wm_present) {
+        return;  /* Property churn that does not change the answer. */
+    }
+    backend->wm_present = wm_now;
+
+    if (wm_now) {
+        /* A WM is up. Any pending "the WM is gone" action is stale — this is what
+         * makes a restart a no-op rather than two rebuilds. */
+        if (backend->wm_gone_deadline_ms) {
+            log_debug("X11: window manager came back before the rebuild deadline "
+                      "- cancelling");
+            backend->wm_gone_deadline_ms = 0;
+        }
+        x11_apply_wm_transition(backend);
+        return;
+    }
+
+    /* The WM is gone. Do not believe it yet. */
+    if (x11_wm_transition(backend->or_env_forced, backend->override_redirect,
+                          false) == X11_WM_ACTION_NONE) {
+        return;  /* Nothing would change anyway (forced, or already override-redirect). */
+    }
+    log_info("X11: EWMH window manager went away - waiting %d ms for a replacement",
+             X11_WM_GONE_DEBOUNCE_MS);
+    backend->wm_gone_deadline_ms = get_time_ms() + X11_WM_GONE_DEBOUNCE_MS;
+}
+
+/* Called every event-loop iteration. Fires the deferred WM-went-away rebuild once
+ * the debounce window has passed and no replacement WM has turned up. */
+static void x11_check_wm_gone_deadline(x11_backend_data_t *backend) {
+    if (!backend->wm_gone_deadline_ms ||
+        get_time_ms() < backend->wm_gone_deadline_ms) {
+        return;
+    }
+    backend->wm_gone_deadline_ms = 0;
+
+    /* Re-probe rather than trusting the earlier answer: a replacement WM may have
+     * come up without us having processed its PropertyNotify yet. */
+    backend->wm_present = x11_ewmh_wm_present(backend);
+    if (backend->wm_present) {
+        log_info("X11: a replacement window manager is running - keeping the "
+                 "managed wallpaper windows");
+        return;
+    }
+    x11_apply_wm_transition(backend);
+}
+
+/* ============================================================================
  * EVENT HANDLING OPERATIONS
  * ============================================================================ */
 
@@ -1454,6 +1788,7 @@ static bool x11_dispatch_events(void *backend_data) {
     }
 
     bool layout_changed = false;
+    bool wm_check_changed = false;
     bool mouse_on = backend->state &&
         atomic_load_explicit(&backend->state->mouse_interaction, memory_order_acquire);
 
@@ -1477,6 +1812,42 @@ static bool x11_dispatch_events(void *backend_data) {
                 }
                 break;
 
+            case Expose:
+                /* The window's contents were discarded and must be redrawn. Only
+                 * the last event of a burst matters (count == 0 = no more to come). */
+                if (event.xexpose.count == 0) {
+                    x11_mark_window_dirty(backend, event.xexpose.window);
+                }
+                break;
+
+            case PropertyNotify:
+                /* A window manager starting (or cleanly exiting) rewrites
+                 * _NET_SUPPORTING_WM_CHECK on the root. Coalesce a burst — a WM
+                 * start can touch the property more than once — into one re-probe
+                 * after the queue drains.
+                 *
+                 * The atom test is load-bearing, not just an optimisation:
+                 * x11_commit_surface XSendEvents a synthetic PropertyNotify for
+                 * _XROOTPMAP_ID to the root (to poke Conky) once a second, and now
+                 * that we select PropertyChangeMask on the root we receive our own
+                 * event back. */
+                if (event.xproperty.window == backend->root_window &&
+                    event.xproperty.atom == backend->atom_net_supporting_wm_check) {
+                    wm_check_changed = true;
+                }
+                break;
+
+            case DestroyNotify:
+                /* The WM's _NET_SUPPORTING_WM_CHECK window has been destroyed. A
+                 * WM that is killed outright (kill -9, crash) does not clean up the
+                 * root property, so this is the only notification we get that it
+                 * has gone; waiting for a PropertyNotify would wait for ever. */
+                if (backend->wm_check_window != None &&
+                    event.xdestroywindow.window == backend->wm_check_window) {
+                    wm_check_changed = true;
+                }
+                break;
+
             default:
                 /* RRScreenChangeNotify: monitor layout changed. Coalesce a burst
                  * of notifies (mode set fires several) into one reconcile after
@@ -1489,6 +1860,14 @@ static bool x11_dispatch_events(void *backend_data) {
                 break;
         }
     }
+
+    if (wm_check_changed) {
+        x11_recheck_wm(backend);
+    }
+
+    /* Deferred WM-went-away rebuild. Checked every iteration (the event loop polls
+     * with at most a 1s timeout), not on a busy poll of the X server. */
+    x11_check_wm_gone_deadline(backend);
 
     if (layout_changed) {
         log_info("X11: monitor layout changed, reconciling outputs");
